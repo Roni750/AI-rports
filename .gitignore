@@ -39,3 +39,12 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Raw BTS downloads: ~390MB, regenerable via scripts/download_data.py
+data/raw/
+data/*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
