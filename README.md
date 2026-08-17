@@ -1,36 +1,119 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Airport Investment Intelligence Agent
 
-## Getting Started
+An AI agent that helps analysts identify US airports where expansion is most warranted, using
+public aviation data from the Bureau of Transportation Statistics.
 
-First, run the development server:
+Ask it questions in plain English:
+
+> *Which airports in New England are strong candidates for terminal expansion?*
+> *Compare LA and Santa Ana airport congestion levels.*
+> *What is the unmet flight demand in SFO airport and why?*
+
+---
+
+## The one thing to know about the architecture
+
+**The language model computes nothing.** It chooses which of six tools to call, passes parameters,
+and narrates the results. Every figure in every answer originates in deterministic, unit-tested
+TypeScript below the tool boundary.
+
+For an investment decision, a fabricated number is worse than no number — so this is enforced by
+structure rather than by asking the prompt nicely. The chat UI shows the tool trace behind each
+answer, making it auditable.
+
+---
+
+## Quick start
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+cp .env.local.example .env.local     # add your GROQ_API_KEY
+npm run dev                          # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Get a free Groq key at [console.groq.com](https://console.groq.com). The dataset is committed, so
+no ingestion step is needed to run the app.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+---
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Documentation
 
-## Learn More
+| Document | What's in it |
+|---|---|
+| **[DESIGN.md](DESIGN.md)** | Scoring methodology, key tradeoffs, where AI is used — **start here** |
+| [docs/architecture-diagrams.md](docs/architecture-diagrams.md) | System overview, data pipeline, scoring flow, agent loop, ambiguity handling |
+| [docs/scoring-methodology.md](docs/scoring-methodology.md) | The model from first principles, no jargon assumed |
+| [docs/data-architecture.md](docs/data-architecture.md) | Ingestion, entity modelling, how missing sources would be added |
 
-To learn more about Next.js, take a look at the following resources:
+---
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## What it measures
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+A **demand-side expansion-opportunity score** — evidence that passenger demand exceeds what an
+airport's current physical capacity can serve.
 
-## Deploy on Vercel
+**Not profitability.** Construction cost, financing terms and concession revenue are not public, so
+no honest system can rank profitability from flight data. That boundary is stated in the answers
+themselves, not buried here.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Four components, each converted to a percentile within the airport's size cohort, then weighted:
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| Component | Weight | Measures |
+|---|---|---|
+| Demand pressure | 0.30 | Load factor — are the aircraft full? |
+| Capacity strain | 0.25 | NAS delay per arrival — is the airport struggling today? |
+| Growth momentum | 0.25 | Passenger growth — is demand still rising? |
+| Frequency constraint | 0.20 | Bigger aircraft rather than more flights — revealed inability to add flights |
+
+Every ranking ships with a **robustness note** stating which entries survive alternative weightings,
+because the weights are a judgement call and the product should say so.
+
+---
+
+## Data
+
+| Source | Coverage |
+|---|---|
+| BTS T-100 Segment (all carriers) | 2019, 2023, 2024 — passengers, seats, departures, distance, freight |
+| BTS On-Time Performance | All 12 months of 2024 — delay minutes with cause attribution |
+
+~390 MB of raw government files are reduced offline to a **5.8 MB SQLite database** that is
+committed and deployed with the app. The application never parses a CSV.
+
+Rebuild from source:
+
+```bash
+npm run data:download    # pulls from BTS, ~10 minutes
+npm run data:build       # -> data/aviation.db
+```
+
+---
+
+## Verification
+
+```bash
+npm run verify             # typecheck + 56 tests
+npm run data:smoke         # scoring engine against real data
+npm run data:verify-tools  # the brief's four questions, end to end
+npm run models             # list models the configured API key can use
+```
+
+---
+
+## Project layout
+
+```
+lib/scoring/      deterministic scoring engine — percentiles, cohorts, robustness
+lib/tools/        six typed tools; assumptions travel as data, not prose
+lib/agent/        bounded tool-calling loop, tool schemas, system prompt
+lib/data/         read-only SQLite access (the only file that knows the storage format)
+app/api/chat/     chat endpoint (Node runtime — node:sqlite is unavailable on Edge)
+app/page.tsx      chat UI with the tool trace panel
+scripts/          Python data pipeline + TypeScript verification scripts
+docs/             design documentation
+```
+
+## Stack
+
+Next.js 16 · React 19 · TypeScript · Tailwind 4 · `node:sqlite` (no native module) ·
+Groq for inference · Python + pandas for offline data preparation only
