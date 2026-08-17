@@ -97,6 +97,38 @@ export interface ToolTraceEntry {
 	durationMs: number;
 }
 
+/**
+ * Where the wall-clock time actually went.
+ *
+ * Added for the voice work. After a user stops speaking the agent loop is by far the largest term
+ * in the budget, and whether it is 1.5s or 5s decides how much perceived-latency engineering is
+ * worth doing. Measuring beats estimating.
+ */
+export interface AgentTiming {
+	/** One entry per model call, in order. */
+	modelMs: number[];
+	/** Sum of all model calls — expected to dominate. */
+	totalModelMs: number;
+	/** Sum of all tool executions. Local SQLite, so expected to be negligible. */
+	totalToolMs: number;
+	/** End to end inside runAgent. */
+	totalMs: number;
+	/**
+	 * Serialized request size per model call, in characters.
+	 *
+	 * The whole conversation is re-sent on every iteration — system prompt, tool schemas, history,
+	 * and every prior tool result. That growth is what consumes a tokens-per-minute budget, so it
+	 * has to be visible before it can be argued about.
+	 */
+	requestChars: number[];
+	/** Fixed prefix re-sent every call: system prompt + tool schemas. */
+	prefixChars: number;
+	/** Sum of requestChars — the real cost of one question. */
+	totalRequestChars: number;
+	/** Model calls that were retried because of a 429. Long modelMs values are usually this. */
+	rateLimitRetries: number;
+}
+
 export interface AgentResult {
 	reply: string;
 	trace: ToolTraceEntry[];
@@ -104,6 +136,7 @@ export interface AgentResult {
 	model: string;
 	/** Set when the loop hit its iteration cap without the model producing a final answer. */
 	truncated: boolean;
+	timing: AgentTiming;
 }
 
 interface ApiToolCall {
@@ -131,30 +164,40 @@ export class AgentError extends Error {
 	}
 }
 
+/** Reported back so the caller can attribute a slow call to a retry rather than to generation. */
+export interface CallStats {
+	requestChars: number;
+	rateLimitRetries: number;
+}
+
 async function callModel(
 	messages: ApiMessage[],
 	apiKey: string,
 	model: string,
 	signal?: AbortSignal,
 	withTools = true,
+	stats?: CallStats,
 ): Promise<ApiMessage> {
 	for (let attempt = 0; ; attempt++) {
+		const payload = JSON.stringify({
+			model,
+			messages,
+			// Omitting tools on the closing call saves the whole schema block, which is a meaningful
+			// share of the token budget when no further tool calls are wanted anyway.
+			...(withTools ? {tools: TOOL_SCHEMAS, tool_choice: "auto"} : {}),
+			// Low but non-zero: tool selection should be near-deterministic, while prose stays readable.
+			temperature: 0.2,
+			max_tokens: 900,
+		});
+		if (stats && attempt === 0) stats.requestChars = payload.length;
+
 		const res = await fetch(GROQ_URL, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
 				Authorization: `Bearer ${apiKey}`,
 			},
-			body: JSON.stringify({
-				model,
-				messages,
-				// Omitting tools on the closing call saves the whole schema block, which is a meaningful
-				// share of the token budget when no further tool calls are wanted anyway.
-				...(withTools ? {tools: TOOL_SCHEMAS, tool_choice: "auto"} : {}),
-				// Low but non-zero: tool selection should be near-deterministic, while prose stays readable.
-				temperature: 0.2,
-				max_tokens: 900,
-			}),
+			body: payload,
 			signal,
 		});
 
@@ -175,6 +218,7 @@ async function callModel(
 			// Retry rather than failing: the token window resets in tens of seconds, and a demo that
 			// recovers on its own is worth far more than one that shows an error.
 			if (attempt < MAX_RATE_LIMIT_RETRIES) {
+				if (stats) stats.rateLimitRetries++;
 				const wait = retryDelayMs(res.headers, attempt);
 				await new Promise((r) => setTimeout(r, wait));
 				continue;
@@ -240,9 +284,48 @@ export async function runAgent(
 	const trace: ToolTraceEntry[] = [];
 	let iterations = 0;
 
+	const startedAt = Date.now();
+	const modelMs: number[] = [];
+	const requestChars: number[] = [];
+	let rateLimitRetries = 0;
+
+	// The fixed prefix re-sent on every single call, measured once rather than estimated.
+	const prefixChars = JSON.stringify({
+		messages: [{role: "system", content: systemPrompt()}],
+		tools: TOOL_SCHEMAS,
+	}).length;
+
+	const timing = (): AgentTiming => ({
+		modelMs,
+		totalModelMs: modelMs.reduce((a, b) => a + b, 0),
+		totalToolMs: trace.reduce((a, t) => a + t.durationMs, 0),
+		totalMs: Date.now() - startedAt,
+		requestChars,
+		prefixChars,
+		totalRequestChars: requestChars.reduce((a, b) => a + b, 0),
+		rateLimitRetries,
+	});
+
+	/** Wraps every model call so no timing path can be forgotten. */
+	const timedCall = async (
+		msgs: ApiMessage[],
+		withTools = true,
+	): Promise<ApiMessage> => {
+		const t0 = Date.now();
+		const stats: CallStats = {requestChars: 0, rateLimitRetries: 0};
+		try {
+			return await callModel(msgs, apiKey, model, signal, withTools, stats);
+		} finally {
+			// Recorded even on failure — a slow call that then errors is exactly the case worth seeing.
+			modelMs.push(Date.now() - t0);
+			requestChars.push(stats.requestChars);
+			rateLimitRetries += stats.rateLimitRetries;
+		}
+	};
+
 	while (iterations < MAX_ITERATIONS) {
 		iterations++;
-		const message = await callModel(messages, apiKey, model, signal);
+		const message = await timedCall(messages);
 
 		const toolCalls = message.tool_calls ?? [];
 		if (toolCalls.length === 0) {
@@ -252,6 +335,7 @@ export async function runAgent(
 				iterations,
 				model,
 				truncated: false,
+				timing: timing(),
 			};
 		}
 
@@ -289,7 +373,7 @@ export async function runAgent(
 	}
 
 	// Cap reached. Ask once for a final answer with no tools, rather than returning nothing.
-	const closing = await callModel(
+	const closing = await timedCall(
 		[
 			...messages,
 			{
@@ -299,9 +383,6 @@ export async function runAgent(
 					"If something is still missing, say what and why.",
 			},
 		],
-		apiKey,
-		model,
-		signal,
 		false,
 	);
 
@@ -313,5 +394,6 @@ export async function runAgent(
 		iterations,
 		model,
 		truncated: true,
+		timing: timing(),
 	};
 }

@@ -46,12 +46,14 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     type: "function",
     function: {
       name: "resolveAirport",
+      // Descriptions are kept to the trigger condition plus anything the model cannot infer from
+      // the result shape. The prose that explained *why* each rule exists lived here at ~440 chars
+      // per tool and was re-sent on every call; it now lives in the code comments instead.
       description:
-        "Turn an airport name, city, or code into one or more airports. ALWAYS call this first when " +
-        "the user names a place informally (for example 'LA', 'the Bay Area', 'Boston'). It returns " +
-        "kind='ambiguous' with the possible readings when a name could mean either one airport or a " +
-        "whole metro area — in that case ask the user which they meant rather than choosing. It also " +
-        "reports when an airport belongs to a metro area shared with other airports.",
+        "Turn an airport name, city, or code into airports. Call first when a place is named " +
+        "informally ('LA', 'the Bay Area'). Returns kind='ambiguous' with the possible readings " +
+        "when a name could mean one airport or a whole metro — ask which was meant. Also reports " +
+        "metro membership.",
       parameters: {
         type: "object",
         properties: {
@@ -69,9 +71,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     function: {
       name: "getAirportMetrics",
       description:
-        "All figures for one airport: passengers, seats, departures, load factor, average aircraft " +
-        "size, international and long-haul shares, freight, congestion (delay) figures, and a " +
-        "multi-year history for trend questions.",
+        "All figures for one airport: passengers, seats, departures, load factor, aircraft size, " +
+        "international and long-haul shares, freight, delay figures, and multi-year history.",
       parameters: {
         type: "object",
         properties: {
@@ -87,10 +88,9 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       name: "rankAirports",
       description:
         "Rank airports by expansion-opportunity score. Use for 'which airports are strong " +
-        "candidates' questions. Returns a robustness note stating which entries survive different " +
-        "weightings — always relay it. Filter by size cohort, US states, a named region, or a metro. " +
-        "Prefer filtering to a single cohort: scores are percentile-based within a cohort and are " +
-        "NOT comparable across cohorts.",
+        "candidates' questions. For a region or state question, pass states/region and do NOT also " +
+        "set cohort — the answer should cover the whole region, and the result labels any cohort " +
+        "spread itself. Set cohort only when the user asks about one size class.",
       parameters: {
         type: "object",
         properties: {
@@ -139,9 +139,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     function: {
       name: "compareAirports",
       description:
-        "Compare two to six airports side by side on congestion, load factor, taxi-out time, " +
-        "aircraft size and route count. Returns observations naming the differences that matter, " +
-        "including when the airports share a metro area or sit in different size cohorts.",
+        "Compare two to six airports on congestion, load factor, taxi-out, aircraft size and route " +
+        "count. Returns observations naming the differences that matter.",
       parameters: {
         type: "object",
         properties: {
@@ -160,10 +159,9 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     function: {
       name: "explainScore",
       description:
-        "Break an airport's score into its four components, showing the raw value, its percentile " +
-        "within the airport's cohort, the weight, and the points contributed. Also returns seasonal " +
-        "delay detail and a plain-language read of the profile. Use this for any 'why' question — " +
-        "the component pattern matters far more than the total.",
+        "Break a score into its four components: raw value, percentile in cohort, weight, points " +
+        "contributed. Also returns seasonal delay detail and a read of the profile. Use for any " +
+        "'why' question — the component pattern matters more than the total.",
       parameters: {
         type: "object",
         properties: {
@@ -178,9 +176,9 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     function: {
       name: "flightMix",
       description:
-        "Traffic composition for one airport: short/medium/long-haul split by passengers, " +
-        "domestic versus international, freight tonnage, busiest routes, and individual routes that " +
-        "are running full. Use for 'percentage of long haul flights' and for route-level evidence.",
+        "Traffic composition for one airport: haul split by passengers, domestic vs international, " +
+        "freight tonnage, busiest routes, and routes running full. Use for 'percentage of long haul " +
+        "flights' and for route-level evidence.",
       parameters: {
         type: "object",
         properties: {
