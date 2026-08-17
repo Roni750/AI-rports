@@ -179,11 +179,17 @@ export default function Page() {
           ),
         )}
 
-        {busy && (
-          <p className="text-sm opacity-60" role="status">
-            Querying the dataset…
-          </p>
-        )}
+        {/*
+          Rendered unconditionally, with only its text changing.
+
+          A live region must already exist in the DOM before its content changes, or screen
+          readers can miss the announcement entirely — mounting the element and its text in the
+          same instant is the common way to get a status region that silently announces nothing.
+          https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Reference/Roles/status_role
+        */}
+        <p className="text-sm opacity-60" role="status" aria-atomic="true">
+          {busy ? "Querying the dataset…" : ""}
+        </p>
 
         {error && (
           <div
