@@ -48,17 +48,19 @@ function scoredDefault() {
 
 // --------------------------------------------------------------- shared envelope pieces
 
-const VINTAGE = `${DATA_PROVENANCE.source}; years ${DATA_PROVENANCE.years.join(", ")}. Delay data: BTS On-Time Performance ${YEARS.current}.`;
+/**
+ * Envelope text is kept terse on purpose.
+ *
+ * The standing facts — full source description, excluded years, self-reporting, delay coverage —
+ * live in the system prompt, stated once. Repeating them verbatim on every tool result burned a
+ * significant share of a token-per-minute budget for no added information. What stays here is the
+ * short reminder plus anything genuinely specific to the individual result.
+ */
+const VINTAGE = `BTS T-100 + On-Time Performance; ${DATA_PROVENANCE.years.join("/")}`;
 
-const BASE_ASSUMPTIONS = [
-  "Figures cover scheduled passenger service only (BTS service classes A, C, E, F). Charter is excluded; cargo is reported separately.",
-  DATA_PROVENANCE.excludedYears,
-];
+const BASE_ASSUMPTIONS = ["Scheduled passenger service only; cargo counted separately."];
 
-const BASE_CAVEATS = [
-  "T-100 is mandatory but self-reported by carriers, not independently measured.",
-  "Delay data covers only larger reporting carriers, so roughly 195 of 728 US airports have usable congestion figures.",
-];
+const BASE_CAVEATS = ["Delay figures cover larger reporting carriers only (195 of 728 airports)."];
 
 function envelope(over: Partial<ResultEnvelope> = {}): ResultEnvelope {
   return {
@@ -186,27 +188,56 @@ export function resolveAirport(query: string): ToolResult<ResolveResult> {
 
   // Exact IATA match wins outright.
   const exact = matches.find((m) => m.iata.toUpperCase() === raw.toUpperCase());
+  // findAirports already orders by passengers descending.
   const chosen = exact ?? matches[0];
 
-  // More than one airport in the same city or state is a real ambiguity worth surfacing.
+  /**
+   * Only treat multiple matches as a real ambiguity when the candidates are actually comparable.
+   *
+   * "Anchorage" matches ANC (2.66m passengers) and Merrill Field (1,416). Asking the user to
+   * choose between those is not careful, it is obtuse — nobody asking about Anchorage means the
+   * general-aviation field. But "compare LA and Santa Ana" IS genuinely ambiguous, and metro
+   * aliases are handled above precisely because they always are.
+   *
+   * So: if the busiest match dominates the runner-up by this factor, resolve to it and mention the
+   * alternative in a note rather than blocking on a question.
+   */
+  const DOMINANCE_FACTOR = 10;
+  const notes: string[] = [];
+
   if (!exact && matches.length > 1) {
-    const top = matches.slice(0, 6);
-    return ok(
-      {
-        kind: "ambiguous",
-        interpretations: top.map((m) => ({
-          label: `${m.iata} — ${m.city ?? "unknown city"}`,
-          airports: [m.iata],
-          description: `${Math.round(m.passengers).toLocaleString("en-US")} scheduled passengers in ${YEARS.current}.`,
-        })),
-        notes: [`"${raw}" matched ${matches.length} US airports.`],
-      },
-      envelope(),
+    const [first, second] = matches;
+    const dominates =
+      second.passengers <= 0 || first.passengers / Math.max(second.passengers, 1) >= DOMINANCE_FACTOR;
+
+    if (!dominates) {
+      return ok(
+        {
+          kind: "ambiguous",
+          interpretations: matches.slice(0, 6).map((m) => ({
+            label: `${m.iata} — ${m.city ?? "unknown city"}`,
+            airports: [m.iata],
+            description: `${Math.round(m.passengers).toLocaleString("en-US")} scheduled passengers in ${YEARS.current}.`,
+          })),
+          notes: [
+            `"${raw}" matched ${matches.length} US airports of comparable size, so the intended one is unclear.`,
+          ],
+        },
+        envelope(),
+      );
+    }
+
+    const alternatives = matches
+      .slice(1, 4)
+      .map((m) => `${m.iata} (${Math.round(m.passengers).toLocaleString("en-US")} passengers)`);
+    notes.push(
+      `Interpreted "${raw}" as ${first.iata}, by far the busiest match with ` +
+        `${Math.round(first.passengers).toLocaleString("en-US")} scheduled passengers. ` +
+        `Smaller airports also matched: ${alternatives.join(", ")}.`,
     );
   }
 
   const metro = metroFor(chosen.iata);
-  const notes: string[] = [];
   if (metro) {
     notes.push(
       `${chosen.iata} is part of ${metro.label}, alongside ${metro.siblingAirports.join(", ")}. ` +
@@ -469,6 +500,16 @@ export function rankAirports(params: RankAirportsParams = {}): ToolResult<RankAi
         "It measures demand-side expansion opportunity, NOT profitability: no construction cost, financing or concession revenue data is public.",
       ],
       caveats,
+      // A ranking without its stability is an overstatement of what the model knows, so the note
+      // is mandatory. Same for the cross-cohort warning, which changes what the numbers mean.
+      mustMention: [
+        robustness.note,
+        ...(cohortsIncluded.length > 1
+          ? [
+              `This list spans several size cohorts (${cohortsIncluded.join(", ")}); scores are only comparable within a cohort.`,
+            ]
+          : []),
+      ].filter((s) => s.length > 0),
       confidence: "medium",
     }),
   );
@@ -608,7 +649,20 @@ export function compareAirports(codes: string[]): ToolResult<CompareResult> {
     caveats.push(`No data found for: ${missing.join(", ")}. They are omitted from the comparison.`);
   }
 
-  return ok({ rows, observations, sameCohort }, envelope({ caveats, confidence: "high" }));
+  // Whether the airports share a market, and whether their scores are comparable, both change what
+  // the comparison means. Required rather than offered.
+  const required = observations.filter((o) =>
+    /share a catchment area|not directly comparable/.test(o),
+  );
+
+  return ok(
+    { rows, observations, sameCohort },
+    envelope({
+      caveats,
+      ...(required.length > 0 ? { mustMention: required } : {}),
+      confidence: "high",
+    }),
+  );
 }
 
 // --------------------------------------------------------------- 5. explainScore
@@ -862,6 +916,9 @@ export function flightMix(iata: string): ToolResult<FlightMixResult> {
         ...BASE_ASSUMPTIONS,
         "Haul thresholds are our convention, not an industry standard.",
       ],
+      // At a freight hub the cargo business is the bigger story, and a passenger-only percentage
+      // read without it is misleading. Required rather than offered — see ResultEnvelope.mustMention.
+      ...(freightNote ? { mustMention: [freightNote] } : {}),
       confidence: "high",
     }),
   );

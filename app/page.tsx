@@ -1,71 +1,230 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
-	return (
-		<div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-			<main
-				className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-				<Image
-					className="dark:invert h-5 w-[100px]"
-					src="/next.svg"
-					alt="Next.js logo"
-					width={100}
-					height={20}
-					priority
-				/>
-				<div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-					<h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-						To get started, edit the{" "}
-						<code
-							className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-							page.tsx
-						</code>{" "}
-						file.
-					</h1>
-					<p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-						Looking for a starting point or more instructions? Head over to{" "}
-						<a
-							href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-							className="font-medium text-zinc-950 dark:text-zinc-50"
-						>
-							Templates
-						</a>{" "}
-						or the{" "}
-						<a
-							href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-							className="font-medium text-zinc-950 dark:text-zinc-50"
-						>
-							Learning
-						</a>{" "}
-						center.
-					</p>
-				</div>
-				<div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-					<a
-						className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-						href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-						target="_blank"
-						rel="noopener noreferrer"
-					>
-						<Image
-							className="dark:invert h-[14px] w-4"
-							src="/vercel.svg"
-							alt="Vercel logomark"
-							width={16}
-							height={14}
-						/>
-						Deploy Now
-					</a>
-					<a
-						className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-						href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-						target="_blank"
-						rel="noopener noreferrer"
-					>
-						Documentation
-					</a>
-				</div>
-			</main>
-		</div>
-	);
+import { useEffect, useRef, useState } from "react";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+
+/**
+ * Chat interface for the airport investment agent.
+ *
+ * The tool trace is shown rather than hidden. It is the visible proof of the architecture: every
+ * figure in an answer came from a named tool call, so a reader can see the model routed and
+ * narrated rather than invented.
+ */
+
+interface ToolTraceEntry {
+  name: string;
+  arguments: Record<string, unknown>;
+  ok: boolean;
+  errorCode?: string;
+  durationMs: number;
+}
+
+interface Turn {
+  role: "user" | "assistant";
+  content: string;
+  trace?: ToolTraceEntry[];
+  model?: string;
+  truncated?: boolean;
+}
+
+/** The brief's four questions, each of which exercises a different capability. */
+const EXAMPLES = [
+  "Which airports in New England are strong candidates for terminal expansion?",
+  "Compare LA and Santa Ana airport congestion levels.",
+  "What is the percentage of long haul flights out of Anchorage airport?",
+  "What is the unmet flight demand in SFO airport and why?",
+];
+
+export default function Page() {
+  const [turns, setTurns] = useState<Turn[]>([]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<{ message: string; hint?: string } | null>(null);
+  const [openTrace, setOpenTrace] = useState<number | null>(null);
+  const endRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [turns, busy]);
+
+  async function send(text: string) {
+    const question = text.trim();
+    if (!question || busy) return;
+
+    setError(null);
+    setInput("");
+    const nextTurns: Turn[] = [...turns, { role: "user", content: question }];
+    setTurns(nextTurns);
+    setBusy(true);
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: nextTurns.map((t) => ({ role: t.role, content: t.content })),
+        }),
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        setError({ message: data.error ?? `Request failed (${res.status})`, hint: data.hint });
+        return;
+      }
+
+      setTurns((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: data.reply,
+          trace: data.trace,
+          model: data.model,
+          truncated: data.truncated,
+        },
+      ]);
+    } catch (err) {
+      setError({
+        message: err instanceof Error ? err.message : "Network request failed.",
+        hint: "Is the dev server still running?",
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <main className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-4 px-4 py-6">
+      <header className="border-b border-current/10 pb-4">
+        <h1 className="text-lg font-semibold">Airport Investment Intelligence</h1>
+        <p className="mt-1 text-sm opacity-70">
+          Screens US airports for expansion opportunity using BTS traffic and delay data
+          (2019, 2023, 2024). Measures demand-side opportunity, not profitability.
+        </p>
+      </header>
+
+      {turns.length === 0 && (
+        <section aria-label="Example questions" className="flex flex-col gap-2">
+          <p className="text-sm opacity-60">Try one of these:</p>
+          {EXAMPLES.map((q) => (
+            <button
+              key={q}
+              type="button"
+              onClick={() => send(q)}
+              disabled={busy}
+              className="rounded-lg border border-current/15 px-3 py-2 text-left text-sm transition hover:border-current/40 hover:bg-current/5 disabled:opacity-50"
+            >
+              {q}
+            </button>
+          ))}
+        </section>
+      )}
+
+      <div className="flex flex-1 flex-col gap-4">
+        {turns.map((turn, i) =>
+          turn.role === "user" ? (
+            <div key={i} className="self-end rounded-2xl bg-current/10 px-4 py-2 text-sm">
+              {turn.content}
+            </div>
+          ) : (
+            <div key={i} className="flex flex-col gap-2">
+              <div className="answer text-sm leading-relaxed">
+                <Markdown remarkPlugins={[remarkGfm]}>{turn.content}</Markdown>
+              </div>
+
+              {turn.truncated && (
+                <p className="text-xs text-amber-600 dark:text-amber-500">
+                  Reached the step limit — this answer may be incomplete.
+                </p>
+              )}
+
+              {turn.trace && turn.trace.length > 0 && (
+                <div className="text-xs">
+                  <button
+                    type="button"
+                    onClick={() => setOpenTrace(openTrace === i ? null : i)}
+                    className="opacity-60 underline decoration-dotted hover:opacity-100"
+                  >
+                    {openTrace === i ? "Hide" : "Show"} data sources ({turn.trace.length}{" "}
+                    {turn.trace.length === 1 ? "tool call" : "tool calls"})
+                  </button>
+
+                  {openTrace === i && (
+                    <ul className="mt-2 flex flex-col gap-1 rounded-lg border border-current/10 p-2 font-mono">
+                      {turn.trace.map((t, j) => (
+                        <li key={j} className="flex flex-wrap items-baseline gap-2">
+                          <span className={t.ok ? "text-emerald-600 dark:text-emerald-500" : "text-red-600 dark:text-red-500"}>
+                            {t.ok ? "ok" : t.errorCode ?? "error"}
+                          </span>
+                          <span className="font-semibold">{t.name}</span>
+                          <span className="opacity-60">
+                            {Object.keys(t.arguments).length > 0
+                              ? JSON.stringify(t.arguments)
+                              : "{}"}
+                          </span>
+                          <span className="opacity-40">{t.durationMs}ms</span>
+                        </li>
+                      ))}
+                      {turn.model && (
+                        <li className="mt-1 border-t border-current/10 pt-1 opacity-50">
+                          model: {turn.model} — every figure above came from these calls, not from
+                          the model
+                        </li>
+                      )}
+                    </ul>
+                  )}
+                </div>
+              )}
+            </div>
+          ),
+        )}
+
+        {busy && (
+          <p className="text-sm opacity-60" role="status">
+            Querying the dataset…
+          </p>
+        )}
+
+        {error && (
+          <div
+            role="alert"
+            className="rounded-lg border border-red-500/40 bg-red-500/5 px-3 py-2 text-sm"
+          >
+            <p className="font-medium">{error.message}</p>
+            {error.hint && <p className="mt-1 opacity-70">{error.hint}</p>}
+          </div>
+        )}
+
+        <div ref={endRef} />
+      </div>
+
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          send(input);
+        }}
+        className="sticky bottom-0 flex gap-2 border-t border-current/10 bg-[var(--background)] pt-3"
+      >
+        <label htmlFor="question" className="sr-only">
+          Ask about an airport
+        </label>
+        <input
+          id="question"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="Ask about an airport, a region, or a comparison…"
+          disabled={busy}
+          autoComplete="off"
+          className="flex-1 rounded-lg border border-current/20 bg-transparent px-3 py-2 text-sm outline-none focus:border-current/50 disabled:opacity-50"
+        />
+        <button
+          type="submit"
+          disabled={busy || input.trim() === ""}
+          className="rounded-lg border border-current/20 px-4 py-2 text-sm font-medium transition hover:bg-current/10 disabled:opacity-40"
+        >
+          Ask
+        </button>
+      </form>
+    </main>
+  );
 }

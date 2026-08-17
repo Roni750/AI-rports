@@ -1,0 +1,317 @@
+import { dispatchTool, TOOL_SCHEMAS } from "./tool-schemas";
+import { systemPrompt } from "./system-prompt";
+
+/**
+ * The agent loop.
+ *
+ * Structurally a workflow with one agentic segment: the model chooses which tools to call and in
+ * what order, but the set of tools is fixed, every call is validated, and the loop is bounded. That
+ * is deliberate — a constrained system is predictable, and for an investment tool predictability
+ * matters more than autonomy.
+ *
+ * Provider is Groq, whose API is OpenAI-compatible. Called over plain fetch rather than an SDK:
+ * one dependency fewer, and the request shape is worth being explicit about.
+ */
+
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+
+/**
+ * Overridable so a model deprecation is a config change, not a code change — which already earned
+ * its place: Groq removed the Llama 3.x family, so the original default stopped resolving.
+ *
+ * gpt-oss-120b is the strongest tool-caller currently on Groq's free tier, with a 131k context
+ * window. `npm run models` lists what a given key can actually use.
+ */
+export const DEFAULT_MODEL = process.env.GROQ_MODEL ?? "openai/gpt-oss-120b";
+
+/** Bounds the loop. Each iteration is one model call plus its tool executions. */
+const MAX_ITERATIONS = 6;
+
+/**
+ * Groq's free tier limits tokens per minute (8,000 at the time of writing), not requests, so the
+ * binding constraint is payload size. Tool results are the largest single contributor, and much of
+ * their bulk is noise: 14 significant figures on a load factor, arrays longer than any answer
+ * needs, and null fields carrying no information.
+ *
+ * Compacting is not only a quota measure — a smaller, cleaner payload also keeps the model focused
+ * on the figures that matter.
+ */
+const MODEL_PAYLOAD_LIMITS = {
+  maxArrayLength: 8,
+  /** Values below this get 2 decimals; above it, whole numbers. Passenger counts don't need decimals. */
+  decimalThreshold: 1000,
+};
+
+function compactForModel(value: unknown): unknown {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return null;
+    if (Number.isInteger(value)) return value;
+    return Math.abs(value) < MODEL_PAYLOAD_LIMITS.decimalThreshold
+      ? Math.round(value * 100) / 100
+      : Math.round(value);
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, MODEL_PAYLOAD_LIMITS.maxArrayLength).map(compactForModel);
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      // Drop nulls, undefined and empty arrays: absent is the same as null here, and the schema
+      // already tells the model which fields exist.
+      if (v === null || v === undefined) continue;
+      if (Array.isArray(v) && v.length === 0) continue;
+      out[k] = compactForModel(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** Wait for a 429 to clear, using Groq's own reset hint when it gives one. */
+function retryDelayMs(headers: Headers, attempt: number): number {
+  const retryAfter = headers.get("retry-after");
+  if (retryAfter && Number.isFinite(Number(retryAfter))) {
+    return Math.min(Number(retryAfter) * 1000, 30_000);
+  }
+  // e.g. "26.895s"
+  const reset = headers.get("x-ratelimit-reset-tokens") ?? headers.get("x-ratelimit-reset-requests");
+  const m = reset ? /^([\d.]+)s$/.exec(reset.trim()) : null;
+  if (m) return Math.min(Math.ceil(Number(m[1]) * 1000) + 500, 30_000);
+  return Math.min(2000 * 2 ** attempt, 30_000);
+}
+
+const MAX_RATE_LIMIT_RETRIES = 2;
+
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/** A record of one tool execution, surfaced to the UI so the data path is visible. */
+export interface ToolTraceEntry {
+  name: string;
+  arguments: Record<string, unknown>;
+  ok: boolean;
+  /** Error code when the call failed, so failures are legible in the trace. */
+  errorCode?: string;
+  durationMs: number;
+}
+
+export interface AgentResult {
+  reply: string;
+  trace: ToolTraceEntry[];
+  iterations: number;
+  model: string;
+  /** Set when the loop hit its iteration cap without the model producing a final answer. */
+  truncated: boolean;
+}
+
+interface ApiToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
+
+interface ApiMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  tool_calls?: ApiToolCall[];
+  tool_call_id?: string;
+  name?: string;
+}
+
+export class AgentError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly hint?: string,
+  ) {
+    super(message);
+    this.name = "AgentError";
+  }
+}
+
+async function callModel(
+  messages: ApiMessage[],
+  apiKey: string,
+  model: string,
+  signal?: AbortSignal,
+  withTools = true,
+): Promise<ApiMessage> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(GROQ_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        // Omitting tools on the closing call saves the whole schema block, which is a meaningful
+        // share of the token budget when no further tool calls are wanted anyway.
+        ...(withTools ? { tools: TOOL_SCHEMAS, tool_choice: "auto" } : {}),
+        // Low but non-zero: tool selection should be near-deterministic, while prose stays readable.
+        temperature: 0.2,
+        max_tokens: 900,
+      }),
+      signal,
+    });
+
+    if (res.ok) {
+      const json = (await res.json()) as { choices?: { message?: ApiMessage }[] };
+      const message = json.choices?.[0]?.message;
+      if (!message) throw new AgentError("Groq returned no message.", 502);
+      return message;
+    }
+
+    const body = await res.text().catch(() => "");
+
+    if (res.status === 401) {
+      throw new AgentError("The Groq API key was rejected.", 401, "Check GROQ_API_KEY in .env.local.");
+    }
+
+    if (res.status === 429) {
+      // Retry rather than failing: the token window resets in tens of seconds, and a demo that
+      // recovers on its own is worth far more than one that shows an error.
+      if (attempt < MAX_RATE_LIMIT_RETRIES) {
+        const wait = retryDelayMs(res.headers, attempt);
+        await new Promise((r) => setTimeout(r, wait));
+        continue;
+      }
+      const remaining = res.headers.get("x-ratelimit-remaining-tokens");
+      const reset = res.headers.get("x-ratelimit-reset-tokens");
+      throw new AgentError(
+        "Groq's rate limit is still in effect after retrying.",
+        429,
+        `The free tier allows about 8,000 tokens per minute` +
+          (remaining ? `; ${remaining} remain` : "") +
+          (reset ? `, resetting in ${reset}` : "") +
+          ". Wait a moment and ask again.",
+      );
+    }
+
+    if (res.status === 404 || /model/i.test(body)) {
+      throw new AgentError(
+        `Model "${model}" was not accepted by Groq.`,
+        400,
+        "Set GROQ_MODEL in .env.local to a currently available model. Run: npm run models",
+      );
+    }
+
+    throw new AgentError(`Groq returned ${res.status}: ${body.slice(0, 300)}`, 502);
+  }
+}
+
+/** Parse the model's JSON arguments defensively — it does occasionally emit malformed JSON. */
+function parseArgs(raw: string): { args: Record<string, unknown>; error?: string } {
+  if (!raw || raw.trim() === "") return { args: {} };
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return { args: parsed as Record<string, unknown> };
+    }
+    return { args: {}, error: "Arguments must be a JSON object." };
+  } catch {
+    return { args: {}, error: `Arguments were not valid JSON: ${raw.slice(0, 200)}` };
+  }
+}
+
+export async function runAgent(
+  history: ChatMessage[],
+  options: { apiKey: string; model?: string; signal?: AbortSignal } = { apiKey: "" },
+): Promise<AgentResult> {
+  const { apiKey, signal } = options;
+  const model = options.model ?? DEFAULT_MODEL;
+
+  if (!apiKey) {
+    throw new AgentError(
+      "No Groq API key configured.",
+      500,
+      "Add GROQ_API_KEY=gsk_... to airport-agent/.env.local and restart the dev server.",
+    );
+  }
+
+  const messages: ApiMessage[] = [
+    { role: "system", content: systemPrompt() },
+    ...history.map((m) => ({ role: m.role, content: m.content }) as ApiMessage),
+  ];
+
+  const trace: ToolTraceEntry[] = [];
+  let iterations = 0;
+
+  while (iterations < MAX_ITERATIONS) {
+    iterations++;
+    const message = await callModel(messages, apiKey, model, signal);
+
+    const toolCalls = message.tool_calls ?? [];
+    if (toolCalls.length === 0) {
+      return {
+        reply: message.content?.trim() || "I could not produce an answer for that.",
+        trace,
+        iterations,
+        model,
+        truncated: false,
+      };
+    }
+
+    // The assistant turn carrying the tool calls must be preserved verbatim, or the tool results
+    // that follow have nothing to attach to.
+    messages.push({
+      role: "assistant",
+      content: message.content ?? null,
+      tool_calls: toolCalls,
+    });
+
+    for (const call of toolCalls) {
+      const started = Date.now();
+      const { args, error } = parseArgs(call.function.arguments);
+
+      const result = error
+        ? { ok: false as const, code: "invalid_parameters" as const, message: error }
+        : dispatchTool(call.function.name, args);
+
+      trace.push({
+        name: call.function.name,
+        arguments: args,
+        ok: result.ok,
+        ...(result.ok ? {} : { errorCode: result.code }),
+        durationMs: Date.now() - started,
+      });
+
+      messages.push({
+        role: "tool",
+        tool_call_id: call.id,
+        name: call.function.name,
+        content: JSON.stringify(compactForModel(result)),
+      });
+    }
+  }
+
+  // Cap reached. Ask once for a final answer with no tools, rather than returning nothing.
+  const closing = await callModel(
+    [
+      ...messages,
+      {
+        role: "user",
+        content:
+          "Answer now using only the tool results already gathered. Do not request more tools. " +
+          "If something is still missing, say what and why.",
+      },
+    ],
+    apiKey,
+    model,
+    signal,
+    false,
+  );
+
+  return {
+    reply:
+      closing.content?.trim() ||
+      "I gathered data but could not complete an answer within the step limit.",
+    trace,
+    iterations,
+    model,
+    truncated: true,
+  };
+}

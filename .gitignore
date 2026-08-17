@@ -48,3 +48,6 @@ data/*.log
 __pycache__/
 *.pyc
 .venv/
+
+# ...but do commit the example so the required vars are documented
+!.env.local.example

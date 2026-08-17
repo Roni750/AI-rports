@@ -1,33 +1,38 @@
 {
-    "name": "airport-agent",
-    "version": "0.1.0",
-    "private": true,
-    "scripts": {
-        "dev": "next dev",
-        "build": "next build",
-        "start": "next start",
-        "lint": "eslint",
-        "typecheck": "tsc --noEmit",
-        "test": "vitest run",
-        "data:download": "python scripts/download_data.py",
-        "data:build": "python scripts/build_dataset.py && python scripts/build_delays.py",
-        "data:smoke": "tsx scripts/smoke-score.ts"
-    },
-    "dependencies": {
-        "next": "16.3.1",
-        "react": "19.2.8",
-        "react-dom": "19.2.8"
-    },
-    "devDependencies": {
-        "@tailwindcss/postcss": "^4",
-        "@types/node": "^26.2.0",
-        "@types/react": "^19",
-        "@types/react-dom": "^19",
-        "eslint": "^9",
-        "eslint-config-next": "16.3.1",
-        "tailwindcss": "^4",
-        "tsx": "^4.23.12",
-        "typescript": "^5",
-        "vitest": "^4.1.10"
-    }
+  "name": "airport-agent",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "verify": "npm run typecheck && npm run test",
+    "data:download": "python scripts/download_data.py",
+    "data:build": "python scripts/build_dataset.py && python scripts/build_delays.py",
+    "data:smoke": "tsx scripts/smoke-score.ts",
+    "data:verify-tools": "tsx scripts/verify-tools.ts",
+    "models": "tsx scripts/list-models.ts"
+  },
+  "dependencies": {
+    "next": "16.3.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^26.2.0",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.1",
+    "tailwindcss": "^4",
+    "tsx": "^4.23.12",
+    "typescript": "^5",
+    "vitest": "^4.1.10"
+  }
 }

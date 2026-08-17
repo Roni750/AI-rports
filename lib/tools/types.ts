@@ -29,6 +29,18 @@ export interface ResultEnvelope {
   /** Known limitations affecting how far this answer can be trusted. */
   caveats: string[];
   confidence: Confidence;
+  /**
+   * Context the answer is REQUIRED to convey, not merely offered.
+   *
+   * This field exists because an advisory list gets filtered. Told that caveats were "worth
+   * including where they matter", the model dropped Anchorage's freight note — 5.75 billion pounds
+   * of cargo against 2.66 million passengers — which is the single most important thing about
+   * interpreting that airport's passenger figures.
+   *
+   * Anything placed here is something the answer is wrong without. The system prompt treats it as
+   * mandatory rather than as a suggestion. Structure beats persuasion.
+   */
+  mustMention?: string[];
 }
 
 export interface ToolSuccess<T> extends ResultEnvelope {
