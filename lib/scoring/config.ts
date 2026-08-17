@@ -11,22 +11,47 @@ import type { Cohort, Weights } from "./types";
 /**
  * Default component weights.
  *
- * Rationale:
- *  - demandPressure (0.35) leads, because full aircraft are the most direct evidence that
- *    existing capacity is being consumed.
- *  - growthMomentum (0.25) and capacityStrain (0.25) are equal seconds: demand must be rising
- *    for expansion to pay back, and observable strain confirms the constraint is real today.
- *  - frequencyConstraint (0.15) is smallest despite being the most distinctive signal, because
- *    it is the most indirect -- carriers upgauge for fleet reasons as well as airport ones.
+ * Set from measured properties of the components, not intuition. See scripts/analyze-weights.ts.
  *
- * These are a defensible starting prior. They are NOT calibrated against realised investment
- * returns, because no public dataset links airport expansion projects to their outcomes.
+ *  - demandPressure (0.30) is causally the most direct signal and the easiest to explain, but it
+ *    is by far the LEAST discriminating: across 31 large hubs its coefficient of variation is 2%
+ *    (quartiles 81.0%-83.2%). Airlines all manage to roughly the same load-factor target, so it
+ *    separates airports poorly and is a number they actively steer. Hence 0.30, not more.
+ *  - capacityStrain (0.25) is the most direct evidence of a constraint binding TODAY and cannot
+ *    be gamed by carriers. Held back only by coverage: 195 of 728 airports.
+ *  - growthMomentum (0.25) is required for the investment horizon -- a constrained but shrinking
+ *    airport is not an opportunity. Highest spread of the four (CV 109%).
+ *  - frequencyConstraint (0.20) discriminates well (CV 55%) and correlates 0.00 with load factor
+ *    among large hubs, so it adds genuinely independent information. It is also revealed
+ *    preference rather than a managed target. Capped at 0.20 because of an uncontrolled
+ *    composition effect (see below) and because it correlates 0.5-0.66 with growth in the medium
+ *    and small cohorts, where the two partly measure the same thing.
+ *
+ * KNOWN UNCONTROLLED CONFOUND in frequencyConstraint: how much an airport upgauges depends partly
+ * on WHICH carriers serve it -- regional-heavy airports upgauged harder during the 2019-2024
+ * regional-jet retreat regardless of their own capacity. Percentile ranking removes the
+ * industry-wide LEVEL shift but not this composition effect. Correcting it properly needs a
+ * shift-share control: expected upgauging given the airport's baseline carrier mix, then the
+ * residual. Out of scope here, and disclosed rather than hidden.
+ *
+ * These are a defensible prior. They are NOT calibrated against realised investment returns,
+ * because no public dataset links airport expansion projects to their outcomes. This is why every
+ * ranking ships with a robustness note (see robustness.ts) -- "which conclusions survive any
+ * reasonable weighting" is answerable, while "what is the correct weighting" is not.
  */
 export const DEFAULT_WEIGHTS: Weights = {
-  demandPressure: 0.35,
+  demandPressure: 0.30,
   capacityStrain: 0.25,
   growthMomentum: 0.25,
-  frequencyConstraint: 0.15,
+  frequencyConstraint: 0.20,
+};
+
+/** Human-readable component names, for text the agent relays to a user. */
+export const COMPONENT_LABELS: Record<keyof Weights, string> = {
+  demandPressure: "how full the planes are",
+  capacityStrain: "airport-caused delays",
+  growthMomentum: "passenger growth",
+  frequencyConstraint: "bigger planes rather than more flights",
 };
 
 /**

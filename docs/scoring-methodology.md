@@ -176,21 +176,68 @@ against different populations. Cross-cohort "overall" rankings should not be pro
 
 ## Part 6 — Weighting, and the honest status of the weights
 
-Not every symptom is equally informative, so each gets a weight:
+Not every symptom is equally informative. The weights were set from **measured properties of the
+components**, not from intuition (`scripts/analyze-weights.ts`).
 
-| Component | Weight | Why this weight |
+### First, which components actually discriminate?
+
+A component where every airport scores the same carries no information, however causally important
+it sounds. Across the 31 large hubs (CV = spread relative to the mean):
+
+| Component | sd | p25 | median | p75 | **CV** |
+|---|---|---|---|---|---|
+| Load factor | 1.8 | 81.0 | 82.3 | 83.2 | **2%** |
+| NAS delay | 1.5 | 2.0 | 2.9 | 4.0 | 48% |
+| Passenger growth | 5.3 | 0.6 | 4.7 | 9.2 | 109% |
+| Upgauging | 4.9 | 6.0 | 12.8 | 12.8 | 55% |
+
+**Load factor barely separates airports at all** — every large hub sits between 81% and 83.2% at
+the quartiles, precisely because airlines all manage to the same target. Upgauging discriminates
+about 25x better.
+
+This matters for a common objection: *"upgauging is industry-wide, so won't it flatten out?"* No —
+"everyone upgauged" is a **level shift**, and percentile ranking only cares about *order*, so it is
+invariant to level shifts. What would flatten a component is low **variance**, and upgauging has
+plenty.
+
+### Second, are the components redundant?
+
+Two correlated components are the same measurement counted twice, silently doubling its real
+weight. Spearman correlations among large hubs:
+
+|  | demand | strain | growth | freq |
+|---|---|---|---|---|
+| **demand** | 1.00 | 0.39 | −0.14 | **0.00** |
+| **strain** | 0.39 | 1.00 | −0.00 | −0.21 |
+| **growth** | −0.14 | −0.00 | 1.00 | 0.20 |
+| **freq** | 0.00 | −0.21 | 0.20 | 1.00 |
+
+Near-independent. Upgauging correlates **0.00** with load factor, so it adds genuinely new
+information rather than restating an existing signal.
+
+**Caveat:** in the medium-hub cohort growth ↔ frequency correlates **0.66** (small hubs 0.50). At
+smaller airports, fast growth partly *is* getting bigger aircraft, so those two overlap there.
+
+### The resulting weights
+
+| Component | Weight | Why |
 |---|---|---|
-| Demand pressure | **0.35** | Most direct evidence that existing capacity is being consumed |
-| Capacity strain | **0.25** | Confirms the constraint is real *today*, not theoretical |
-| Growth momentum | **0.25** | Expansion only pays back if demand keeps rising |
-| Frequency constraint | **0.15** | Most distinctive signal, but most indirect — fleet decisions confound it |
+| Demand pressure | **0.30** | Causally direct and easy to explain, but the least discriminating (CV 2%) and a number airlines actively steer |
+| Capacity strain | **0.25** | Most direct evidence a constraint binds *today*; cannot be gamed by carriers. Limited by coverage (195/728) |
+| Growth momentum | **0.25** | Required for the investment horizon; highest spread of the four |
+| Frequency constraint | **0.20** | Discriminates well, independent of load factor, and is revealed preference rather than a managed target |
 
-**These are judgement calls, not measurements.** They live in one visible config file so a reviewer
-can challenge the whole value system at once, and they can be overridden per request.
+**Why frequency is capped at 0.20 rather than pushed higher:** it carries an uncontrolled
+**composition effect**. How much an airport upgauges depends partly on *which carriers serve it* —
+regional-heavy airports upgauged harder during the 2019–2024 regional-jet retreat regardless of
+their own capacity. Percentile ranking removes the industry-wide level shift but **not** this.
+Correcting it properly needs a shift-share control: expected upgauging given the airport's baseline
+carrier mix, then measure the residual. Out of scope, and disclosed rather than hidden.
 
-**They are not calibrated.** Calibration would require a labelled dataset of past airport expansion
-projects and their realised returns. No such public dataset exists. So the weights are a defensible
-starting prior — and saying that is more credible than pretending otherwise.
+**They are still judgement calls, and they are not calibrated.** Calibration would need a labelled
+dataset of past expansion projects and their realised returns, which does not exist publicly. So
+the weights are a defensible prior — which is exactly why every ranking ships with a robustness
+note (Part 9).
 
 ---
 
@@ -240,24 +287,44 @@ component breakdowns rather than just a number.
 
 ---
 
-## Part 9 — Sensitivity: how stable is the ranking?
+## Part 9 — Robustness: which answers survive the weights being wrong?
 
-Top 6 large hubs under different weightings:
+Since the weights cannot be calibrated, "what is the correct weighting?" has no answer. But
+**"which conclusions survive any reasonable weighting?"** does — and that is far more useful to
+someone deciding where to put capital.
 
-| Weighting | Result |
-|---|---|
-| Default | MIA, DFW, EWR, CLT, LGA, MCO |
-| Demand only | EWR, ATL, LAX, MIA, DFW, SEA |
-| Strain only | **SFO**, EWR, FLL, BOS, MCO, LGA |
-| Growth only | BNA, MIA, CLT, DFW, DEN, PHX |
-| Equal weights | MIA, DFW, CLT, EWR, DEN, IAH |
+So **every ranking answer carries a robustness note automatically** (`lib/scoring/robustness.ts`).
+The ranking is recomputed under six fixed weightings — the default, an even split, and one
+emphasising each component at 55% — and the note reports which entries hold up.
 
-**Only Miami and Dallas–Fort Worth appear in every variant.** The rest of the ordering moves
-substantially with the weights.
+Two stability tests, because the two question shapes differ:
 
-**This must be disclosed, not hidden.** The honest statement is: *"Miami and DFW are robust picks
-across any reasonable weighting. Beyond those, the ranking depends on which symptom you privilege,
-and here is how it changes."* Presenting one ordering as fact would overstate what the model knows.
+- **Long list** (more candidates than places): does the airport **stay on the shortlist** under
+  every weighting? Position is not what an investor acts on; making the list is.
+- **Short list** (every candidate shown, e.g. the five LA-basin airports): membership is vacuously
+  true for everyone, so only **order** can vary. Stability means the position barely moves.
+
+### What it actually reports
+
+> **Large hubs:** MIA 81.5, DFW 77.9, EWR 73.2, CLT 68.4, LGA 64.4
+> *DFW stays on this list under all 6 weightings tested. LGA is the least certain (2 of 6
+> weightings, ranking anywhere from 4th to 11th) and rests mainly on airport-caused delays; EWR
+> (4/6), CLT (4/6) and MIA (5/6) also move.*
+
+> **New England:** BGR 86.2, HVN 71.6, PWM 69.4, ACK 68.4, ORH 64.6
+> *BGR stays on this list under all 6 weightings tested. ORH is the least certain (4 of 6
+> weightings, ranking anywhere from 4th to 7th) and rests mainly on passenger growth.*
+
+### The uncomfortable finding, stated plainly
+
+**The rankings are more weight-sensitive than a single ordered list implies.** Typically only one or
+two entries per cohort hold up under all six weightings. LaGuardia can land anywhere from 4th to
+11th depending on which symptom you privilege.
+
+**The correct conclusion is about what the product is for.** This is a **screening tool**, not a
+ranking oracle: it narrows 392 airports to roughly ten worth human analysis. It does not reliably
+identify which one is best, and it says so. Presenting a single ordering as fact would overstate
+what the model knows.
 
 ---
 
