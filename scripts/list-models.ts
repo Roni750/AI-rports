@@ -7,7 +7,7 @@
  * Run: npm run models
  */
 
-import fs from "node:fs";
+import  fs from "node:fs";
 import path from "node:path";
 
 /** Minimal .env.local reader — this script runs outside Next, which would otherwise load it. */
