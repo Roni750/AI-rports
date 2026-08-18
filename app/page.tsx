@@ -158,6 +158,56 @@ export default function Page() {
     const patch = (fn: (turn: Turn) => Turn) =>
       setTurns((prev) => prev.map((t, i) => (i === prev.length - 1 ? fn(t) : t)));
 
+    /*
+     * The API delivers text in a dozen or so chunks, not per token, so rendering each one as it
+     * lands reads as a series of jumps. Arrival cadence and render cadence are separated here:
+     * deltas go into a buffer, and a frame loop drains it a few characters at a time.
+     *
+     * The drain rate is a fraction of what is queued rather than a constant, so it self-corrects.
+     * A big chunk empties quickly instead of putting the text minutes behind the model, and the
+     * tail slows to a readable pace as the buffer runs dry. A fixed characters-per-frame rate
+     * cannot do both.
+     */
+    let pending = "";
+    let rendered = "";
+    let arrived = false;
+    let frame = 0;
+
+    // Someone who has asked the system not to animate wants the answer, not the performance.
+    const instant =
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+
+    const tick = () => {
+      if (pending.length > 0) {
+        const take = Math.max(1, Math.ceil(pending.length / 20));
+        rendered += pending.slice(0, take);
+        pending = pending.slice(take);
+        patch((t) => ({ ...t, content: rendered }));
+      }
+      // Keep looping while more may arrive, or while there is a backlog to finish drawing.
+      frame = !arrived || pending.length > 0 ? requestAnimationFrame(tick) : 0;
+    };
+
+    const pushText = (delta: string) => {
+      if (instant) {
+        rendered += delta;
+        patch((t) => ({ ...t, content: rendered }));
+        return;
+      }
+      pending += delta;
+      if (!frame) frame = requestAnimationFrame(tick);
+    };
+
+    /** Stops the loop and shows the finished text, so the answer never trails the model. */
+    const finishText = (full: string) => {
+      arrived = true;
+      if (frame) cancelAnimationFrame(frame);
+      frame = 0;
+      pending = "";
+      rendered = full;
+    };
+
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -202,10 +252,11 @@ export default function Page() {
               }));
               break;
             case "text":
-              patch((t) => ({ ...t, content: t.content + event.delta }));
+              pushText(event.delta);
               break;
             case "done":
               rememberSessionToken(event.sessionId);
+              finishText(event.result.reply);
               patch((t) => ({
                 ...t,
                 content: event.result.reply,
@@ -220,6 +271,7 @@ export default function Page() {
               break;
             case "error":
               failed = true;
+              finishText("");
               setError({ message: event.error, hint: event.hint });
               break;
           }
@@ -229,6 +281,7 @@ export default function Page() {
       // An error event replaces the answer rather than leaving a half-written one on screen.
       if (failed) setTurns(nextTurns);
     } catch (err) {
+      finishText("");
       setTurns(nextTurns);
       setError({
         message: err instanceof Error ? err.message : "Network request failed.",
