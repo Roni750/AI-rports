@@ -25,6 +25,7 @@
     "models": "tsx scripts/list-models.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.117.1",
     "@libsql/client": "^0.17.4",
     "next": "16.3.1",
     "react": "19.2.8",

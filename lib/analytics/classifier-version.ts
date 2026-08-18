@@ -26,7 +26,7 @@ export const RULES_VERSION = 1;
  * family during this project's lifetime — `llama-3.1-8b-instant`, the obvious choice for this job,
  * no longer resolves — so a model id is an assumption with a shelf life, not a constant.
  */
-export const CLASSIFIER_MODEL = process.env.CLASSIFIER_MODEL ?? "openai/gpt-oss-20b";
+export const CLASSIFIER_MODEL = process.env.CLASSIFIER_MODEL ?? "claude-haiku-4-5";
 
 /**
  * Below this, the LLM stage records an abstention instead of a label.

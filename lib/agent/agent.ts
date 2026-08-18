@@ -5,133 +5,13 @@ import {
 	type MustMention,
 	type RequiredContextCheck,
 } from "../tools/must-mention";
+import Anthropic from "@anthropic-ai/sdk";
+
 import {type ChartPayload, payloadFor} from "../tools/chart-payload";
 import {dispatchTool, TOOL_SCHEMAS} from "./tool-schemas";
 import {systemPrompt} from "./system-prompt";
 
-/**
- * The agent loop.
- *
- * Structurally a workflow with one agentic segment: the model chooses which tools to call and in
- * what order, but the set of tools is fixed, every call is validated, and the loop is bounded. That
- * is deliberate — a constrained system is predictable, and for an investment tool predictability
- * matters more than autonomy.
- *
- * Provider is Groq, whose API is OpenAI-compatible. Called over plain fetch rather than an SDK:
- * one dependency fewer, and the request shape is worth being explicit about.
- */
 
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-
-/**
- * Overridable so a model deprecation is a config change, not a code change — which already earned
- * its place: Groq removed the Llama 3.x family, so the original default stopped resolving.
- *
- * gpt-oss-120b is the strongest tool-caller currently on Groq's free tier, with a 131k context
- * window. `npm run models` lists what a given key can actually use.
- */
-export const DEFAULT_MODEL = process.env.GROQ_MODEL ?? "openai/gpt-oss-120b";
-
-/**
- * Bounds the loop. Each iteration is one model call plus its tool executions.
- *
- * Three, not six, and the binding constraint is the TOKEN BUDGET rather than latency. Every
- * iteration re-sends the whole conversation, and the fixed overhead alone -- system prompt plus the
- * six tool schemas -- is about 1,700 tokens per call before any airport data. A six-iteration turn
- * measured 17,062 prompt tokens, which is more than twice the 8,000-per-minute free-tier
- * allowance: it could not succeed, and it drained the window so the NEXT few questions failed too.
- *
- * Little is lost. That turn hit the cap and truncated anyway, so the extra iterations bought a more
- * expensive failure rather than an answer. Raise this only alongside a higher rate limit.
- */
-const MAX_ITERATIONS = 3;
-
-/**
- * How long one model call may take before it is abandoned.
- *
- * Node's `fetch` has no default timeout, so a connection that opens and never responds holds the
- * request handler open indefinitely — no error, no log line, just a request that never finishes.
- * Generous enough that a slow-but-working answer is never cut off.
- */
-const REQUEST_TIMEOUT_MS = 60_000;
-
-/**
- * Wait, but give up the moment the caller does.
- *
- * A bare `setTimeout` between rate-limit retries ignores the abort signal, so a client that had
- * already disconnected still cost up to 30 seconds of a held request slot per retry — waiting to
- * produce an answer nobody was going to receive.
- */
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
-			reject(signal.reason);
-			return;
-		}
-		const timer = setTimeout(() => {
-			signal?.removeEventListener("abort", onAbort);
-			resolve();
-		}, ms);
-		function onAbort() {
-			clearTimeout(timer);
-			reject(signal!.reason);
-		}
-		signal?.addEventListener("abort", onAbort, {once: true});
-	});
-}
-
-/**
- * Groq's free tier limits tokens per minute (8,000 at the time of writing), not requests, so the
- * binding constraint is payload size. Tool results are the largest single contributor, and much of
- * their bulk is noise: 14 significant figures on a load factor, arrays longer than any answer
- * needs, and null fields carrying no information.
- *
- * Compacting is not only a quota measure — a smaller, cleaner payload also keeps the model focused
- * on the figures that matter.
- */
-const MODEL_PAYLOAD_LIMITS = {
-	maxArrayLength: 8,
-	/** Values below this get 2 decimals; above it, whole numbers. Passenger counts don't need decimals. */
-	decimalThreshold: 1000,
-};
-
-function compactForModel(value: unknown): unknown {
-	if (typeof value === "number") {
-		if (!Number.isFinite(value)) return null;
-		if (Number.isInteger(value)) return value;
-		return Math.abs(value) < MODEL_PAYLOAD_LIMITS.decimalThreshold
-			? Math.round(value * 100) / 100
-			: Math.round(value);
-	}
-	if (Array.isArray(value)) {
-		return value.slice(0, MODEL_PAYLOAD_LIMITS.maxArrayLength).map(compactForModel);
-	}
-	if (value && typeof value === "object") {
-		const out: Record<string, unknown> = {};
-		for (const [k, v] of Object.entries(value)) {
-			// Drop nulls, undefined and empty arrays: absent is the same as null here, and the schema
-			// already tells the model which fields exist.
-			if (v === null || v === undefined) continue;
-			if (Array.isArray(v) && v.length === 0) continue;
-			out[k] = compactForModel(v);
-		}
-		return out;
-	}
-	return value;
-}
-
-/** Wait for a 429 to clear, using Groq's own reset hint when it gives one. */
-function retryDelayMs(headers: Headers, attempt: number): number {
-	const retryAfter = headers.get("retry-after");
-	if (retryAfter && Number.isFinite(Number(retryAfter))) {
-		return Math.min(Number(retryAfter) * 1000, 30_000);
-	}
-	// e.g. "26.895s"
-	const reset = headers.get("x-ratelimit-reset-tokens") ?? headers.get("x-ratelimit-reset-requests");
-	const m = reset ? /^([\d.]+)s$/.exec(reset.trim()) : null;
-	if (m) return Math.min(Math.ceil(Number(m[1]) * 1000) + 500, 30_000);
-	return Math.min(2000 * 2 ** attempt, 30_000);
-}
 
 const MAX_RATE_LIMIT_RETRIES = 2;
 
@@ -188,6 +68,14 @@ export interface AgentTiming {
 	totalRequestChars: number;
 	/** Model calls that were retried because of a 429. Long modelMs values are usually this. */
 	rateLimitRetries: number;
+	/**
+	 * Prefix tokens served from cache across the turn, billed at 0.1x.
+	 *
+	 * Surfaced because a cache that silently stops working looks like nothing at all — the answers
+	 * stay correct and only the bill moves. Zero here across repeated questions means something
+	 * changed the prefix bytes.
+	 */
+	cacheReadTokens: number;
 }
 
 /**
@@ -228,20 +116,52 @@ export interface AgentResult {
 	usage: AgentUsage;
 }
 
-interface ApiToolCall {
-	id: string;
-	type: "function";
-	function: { name: string; arguments: string };
+export const DEFAULT_MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5";
+
+/**
+ * Bounds the loop. Each iteration is one model call plus its tool executions.
+ *
+ * Three rather than six: every iteration re-sends the whole conversation, so a long turn multiplies
+ * the fixed prefix (system prompt plus six tool schemas) by the number of calls. Little is lost —
+ * a turn that needed six iterations was hitting the cap and truncating anyway.
+ */
+const MAX_ITERATIONS = 3;
+
+/** How long one model call may take before it is abandoned. */
+const REQUEST_TIMEOUT_MS = 60_000;
+
+const MODEL_PAYLOAD_LIMITS = {
+	maxArrayLength: 8,
+	/** Values below this get 2 decimals; above it, whole numbers. Passenger counts don't need decimals. */
+	decimalThreshold: 1000,
+};
+
+function compactForModel(value: unknown): unknown {
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) return null;
+		if (Number.isInteger(value)) return value;
+		return Math.abs(value) < MODEL_PAYLOAD_LIMITS.decimalThreshold
+			? Math.round(value * 100) / 100
+			: Math.round(value);
+	}
+	if (Array.isArray(value)) {
+		return value.slice(0, MODEL_PAYLOAD_LIMITS.maxArrayLength).map(compactForModel);
+	}
+	if (value && typeof value === "object") {
+		const out: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(value)) {
+			// Drop nulls, undefined and empty arrays: absent is the same as null here, and the schema
+			// already tells the model which fields exist.
+			if (v === null || v === undefined) continue;
+			if (Array.isArray(v) && v.length === 0) continue;
+			out[k] = compactForModel(v);
+		}
+		return out;
+	}
+	return value;
 }
 
-interface ApiMessage {
-	role: "system" | "user" | "assistant" | "tool";
-	content: string | null;
-	tool_calls?: ApiToolCall[];
-	tool_call_id?: string;
-	name?: string;
-}
-
+/** Reported back so the caller can attribute a slow call to a retry rather than to generation. */
 export class AgentError extends Error {
 	constructor(
 		message: string,
@@ -253,159 +173,174 @@ export class AgentError extends Error {
 	}
 }
 
-/** Reported back so the caller can attribute a slow call to a retry rather than to generation. */
 export interface CallStats {
 	requestChars: number;
 	rateLimitRetries: number;
 	/** From the provider's own `usage` block. Null when it omitted one — never inferred. */
 	promptTokens: number | null;
 	completionTokens: number | null;
+	/** Prefix tokens served from cache at 0.1x. Zero on a cold call, high on every call after. */
+	cacheReadTokens: number;
+}
+
+/**
+ * The tool schemas, translated from the OpenAI function shape into Anthropic's.
+ *
+ * `tool-schemas.ts` stays in the OpenAI shape on purpose: `dispatchTool` and its per-parameter
+ * validation are the load-bearing part of the tool boundary, and a provider swap has no business
+ * touching them. Translating here keeps the change to one function.
+ *
+ * Computed once — the schemas are static, and rebuilding them per call would defeat prompt caching,
+ * which keys on the exact bytes of the tools block.
+ */
+const ANTHROPIC_TOOLS: Anthropic.Tool[] = TOOL_SCHEMAS.map((t) => ({
+	name: t.function.name,
+	description: t.function.description,
+	input_schema: t.function.parameters as Anthropic.Tool.InputSchema,
+}));
+
+let client: Anthropic | null = null;
+
+function anthropic(apiKey: string): Anthropic {
+	if (!client) client = new Anthropic({apiKey, maxRetries: MAX_RATE_LIMIT_RETRIES});
+	return client;
 }
 
 async function callModel(
-	messages: ApiMessage[],
+	messages: Anthropic.MessageParam[],
 	apiKey: string,
 	model: string,
 	signal?: AbortSignal,
 	withTools = true,
 	stats?: CallStats,
-): Promise<ApiMessage> {
-	for (let attempt = 0; ; attempt++) {
-		const payload = JSON.stringify({
-			model,
-			messages,
-			// Omitting tools on the closing call saves the whole schema block, which is a meaningful
-			// share of the token budget when no further tool calls are wanted anyway.
-			...(withTools ? {tools: TOOL_SCHEMAS, tool_choice: "auto"} : {}),
-			// Low but non-zero: tool selection should be near-deterministic, while prose stays readable.
-			temperature: 0.2,
-			max_tokens: 900,
-		});
-		if (stats && attempt === 0) stats.requestChars = payload.length;
+): Promise<Anthropic.Message> {
+	const params: Anthropic.MessageCreateParamsNonStreaming = {
+		model,
+		/*
+		 * Cached as a block rather than a bare string.
+		 *
+		 * The system prompt and the six tool schemas are ~1,700 tokens that never change, and they
+		 * were being re-sent at full price on every model call — twice per turn, since the loop
+		 * calls once to pick a tool and again to narrate the result. Caching bills the write at
+		 * 1.25x once and every later read at 0.1x, so it pays for itself inside a single turn.
+		 *
+		 * The breakpoint goes on the LAST cacheable block of the prefix. Tools render before the
+		 * system prompt, so marking the system block caches the tool schemas along with it.
+		 * Everything volatile — the conversation, the tool results — sits after this point and is
+		 * billed normally, which is what keeps the cached prefix byte-identical between calls.
+		 */
+		system: [
+			{
+				type: "text",
+				text: systemPrompt(),
+				cache_control: {type: "ephemeral"},
+			},
+		],
+		messages,
+		// Omitting tools on the closing call saves the whole schema block, which is a meaningful
+		// share of the token budget when no further tool calls are wanted anyway.
+		...(withTools ? {tools: ANTHROPIC_TOOLS} : {}),
+		/*
+		 * No `temperature`. Sampling parameters are rejected outright on this model class, and the
+		 * old value (0.2, for near-deterministic tool selection) has no equivalent knob — tool
+		 * choice is steered by the schemas and the system prompt instead.
+		 *
+		 * `max_tokens` is large because thinking is on by default and this ceiling covers thinking
+		 * AND the reply together; the previous 900 would have been consumed before the answer
+		 * started. Effort is low deliberately: this agent's job is to route to a tool and narrate
+		 * the result, which is not the kind of work that rewards deep deliberation, and latency is
+		 * what a user actually feels here.
+		 */
+		max_tokens: 16_000,
+		output_config: {effort: "low"},
+	};
 
+	if (stats) stats.requestChars = JSON.stringify(params).length;
+
+	try {
 		// The caller's signal AND a timeout: the first aborts when the user goes away, the second
 		// when the provider stops answering. Either alone leaves one of the two hangs open.
 		const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
-		const res = await fetch(GROQ_URL, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${apiKey}`,
-			},
-			body: payload,
+		const message = await anthropic(apiKey).messages.create(params, {
 			signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
 		});
 
-		if (res.ok) {
-			const json = (await res.json()) as {
-				choices?: { message?: ApiMessage }[];
-				usage?: { prompt_tokens?: number; completion_tokens?: number };
-			};
-			const message = json.choices?.[0]?.message;
-			if (!message) throw new AgentError("Groq returned no message.", 502);
-			if (stats) {
-				// Token counts ride along on every response and used to be parsed and dropped. They
-				// are the only non-estimated basis for a cost figure, so they are worth the two lines.
-				stats.promptTokens = json.usage?.prompt_tokens ?? null;
-				stats.completionTokens = json.usage?.completion_tokens ?? null;
-			}
-			return message;
-		}
-
-		const body = await res.text().catch(() => "");
-
-		if (res.status === 401) {
-			throw new AgentError("The Groq API key was rejected.", 401, "Check GROQ_API_KEY in .env.local.");
-		}
-
-		if (res.status === 429) {
+		if (stats) {
+			// Token counts ride along on every response and used to be parsed and dropped. They
+			// are the only non-estimated basis for a cost figure, so they are worth the two lines.
 			/*
-			 * Groq enforces four separate buckets: tokens and requests, each per minute and per day.
-			 * Only the per-MINUTE ones come back as headers, so a 429 with a full token window does not
-			 * mean "your request is too big" -- far more often it means a longer-window quota is spent
-			 * and the minute bucket is simply irrelevant.
-			 *
-			 * Guessing between them produced actively harmful advice ("ask something narrower") for a
-			 * daily cap, where nothing the user types can help. So report what the headers actually say
-			 * and let the numbers speak, rather than asserting a cause we cannot see.
+			 * `input_tokens` counts only the UNCACHED remainder — the cached prefix is reported
+			 * separately. Summing all three is what makes the cost figure comparable to the
+			 * pre-caching numbers; reading input_tokens alone would show a sudden 70% "drop" in
+			 * prompt size that never happened.
 			 */
-			const num = (h: string) => {
-				const v = Number(res.headers.get(h));
-				return Number.isFinite(v) ? v : null;
-			};
-			const limitTokens = num("x-ratelimit-limit-tokens");
-			const remainingTokens = num("x-ratelimit-remaining-tokens");
-			const remainingRequests = num("x-ratelimit-remaining-requests");
-			const resetTokens = res.headers.get("x-ratelimit-reset-tokens");
-			const retryAfter = res.headers.get("retry-after");
-
-			// Visible in the server log, because these four numbers are the whole diagnosis and the
-			// browser only ever sees the sentence below.
-			console.warn(
-				"[groq 429]",
-				JSON.stringify({limitTokens, remainingTokens, remainingRequests, resetTokens, retryAfter, attempt}),
-			);
-
-			// A full minute-window that still refuses means the block is NOT the per-minute token
-			// bucket. Retrying re-sends the same prompt against a quota that is not going to move.
-			const minuteWindowIsFull =
-				limitTokens !== null && remainingTokens !== null && limitTokens > 0 &&
-				remainingTokens >= limitTokens * 0.9;
-
-			if (minuteWindowIsFull) {
-				throw new AgentError(
-					"Groq refused the request while the per-minute allowance was still full.",
-					429,
-					`${remainingTokens} of ${limitTokens} tokens/minute remain` +
-					(remainingRequests !== null ? `, ${remainingRequests} requests` : "") +
-					". A full minute window means a longer-window quota is exhausted — most likely the " +
-					"daily token cap — so waiting a moment or asking something shorter will not help. " +
-					"Check the Groq console for daily usage, or use a different key.",
-				);
-			}
-
-			// Genuinely throttled on the minute bucket: it refills in tens of seconds, and a demo that
-			// recovers on its own is worth far more than one that shows an error.
-			if (attempt < MAX_RATE_LIMIT_RETRIES) {
-				if (stats) stats.rateLimitRetries++;
-				await sleep(retryDelayMs(res.headers, attempt), signal);
-				continue;
-			}
-
-			throw new AgentError(
-				"Groq's rate limit is still in effect after retrying.",
-				429,
-				`About ${limitTokens ?? 8000} tokens per minute are allowed` +
-				(remainingTokens !== null ? `; ${remainingTokens} remain` : "") +
-				(resetTokens ? `, resetting in ${resetTokens}` : "") +
-				". Wait a moment and ask again.",
-			);
+			const cacheRead = message.usage.cache_read_input_tokens ?? 0;
+			const cacheWrite = message.usage.cache_creation_input_tokens ?? 0;
+			stats.promptTokens = (message.usage.input_tokens ?? 0) + cacheRead + cacheWrite;
+			stats.completionTokens = message.usage.output_tokens ?? null;
+			stats.cacheReadTokens = cacheRead;
 		}
 
-		if (res.status === 404 || /model/i.test(body)) {
+		/*
+		 * Safety classifiers can decline a request and return a perfectly successful HTTP 200 whose
+		 * `content` is empty. Checked here rather than at the read site because every caller would
+		 * otherwise have to remember to check before indexing into the content blocks.
+		 */
+		if (message.stop_reason === "refusal") {
 			throw new AgentError(
-				`Model "${model}" was not accepted by Groq.`,
+				"The model declined to answer that.",
 				400,
-				"Set GROQ_MODEL in .env.local to a currently available model. Run: npm run models",
+				message.stop_details?.explanation ??
+					"Rephrase the question, or ask about a different airport.",
 			);
 		}
 
-		throw new AgentError(`Groq returned ${res.status}: ${body.slice(0, 300)}`, 502);
+		return message;
+	} catch (err) {
+		if (err instanceof AgentError) throw err;
+
+		// Typed SDK errors, most specific first. The SDK already retries 429 and 5xx with backoff
+		// (maxRetries above), so reaching a rate-limit catch here means the retries were exhausted.
+		if (err instanceof Anthropic.AuthenticationError) {
+			throw new AgentError(
+				"The Anthropic API key was rejected.",
+				401,
+				"Check ANTHROPIC_API_KEY in .env.local.",
+			);
+		}
+		if (err instanceof Anthropic.RateLimitError) {
+			if (stats) stats.rateLimitRetries = MAX_RATE_LIMIT_RETRIES;
+			throw new AgentError(
+				"Anthropic's rate limit is still in effect after retrying.",
+				429,
+				"Wait a moment and ask again, or check the usage limits on the API key.",
+			);
+		}
+		if (err instanceof Anthropic.NotFoundError) {
+			throw new AgentError(
+				`Model "${model}" was not accepted by Anthropic.`,
+				400,
+				"Set ANTHROPIC_MODEL in .env.local to a currently available model. Run: npm run models",
+			);
+		}
+		if (err instanceof Anthropic.APIError) {
+			throw new AgentError(
+				`Anthropic returned an error (${err.status ?? "unknown"}).`,
+				err.status ?? 502,
+				err.message,
+			);
+		}
+		throw err;
 	}
 }
 
-/** Parse the model's JSON arguments defensively — it does occasionally emit malformed JSON. */
-function parseArgs(raw: string): { args: Record<string, unknown>; error?: string } {
-	if (!raw || raw.trim() === "") return {args: {}};
-	try {
-		const parsed = JSON.parse(raw);
-		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-			return {args: parsed as Record<string, unknown>};
-		}
-		return {args: {}, error: "Arguments must be a JSON object."};
-	} catch {
-		return {args: {}, error: `Arguments were not valid JSON: ${raw.slice(0, 200)}`};
-	}
+/** The assistant's own text, concatenated. Thinking blocks carry no text and are skipped. */
+function textOf(message: Anthropic.Message): string {
+	return message.content
+		.filter((b): b is Anthropic.TextBlock => b.type === "text")
+		.map((b) => b.text)
+		.join("")
+		.trim();
 }
 
 export async function runAgent(
@@ -417,16 +352,16 @@ export async function runAgent(
 
 	if (!apiKey) {
 		throw new AgentError(
-			"No Groq API key configured.",
+			"No Anthropic API key configured.",
 			500,
-			"Add GROQ_API_KEY=gsk_... to airport-agent/.env.local and restart the dev server.",
+			"Add ANTHROPIC_API_KEY=sk-ant-... to airport-agent/.env.local and restart the dev server.",
 		);
 	}
 
-	const messages: ApiMessage[] = [
-		{role: "system", content: systemPrompt()},
-		...history.map((m) => ({role: m.role, content: m.content}) as ApiMessage),
-	];
+	const messages: Anthropic.MessageParam[] = history.map((m) => ({
+		role: m.role,
+		content: m.content,
+	}));
 
 	const trace: ToolTraceEntry[] = [];
 	// Accumulated across every tool call in the turn, then deduplicated and ordered once at the
@@ -438,14 +373,15 @@ export async function runAgent(
 	const modelMs: number[] = [];
 	const requestChars: number[] = [];
 	let rateLimitRetries = 0;
+	let cacheReadTokens = 0;
 	let promptTokens: number | null = null;
 	let completionTokens: number | null = null;
 	let callsMissingUsage = 0;
 
 	// The fixed prefix re-sent on every single call, measured once rather than estimated.
 	const prefixChars = JSON.stringify({
-		messages: [{role: "system", content: systemPrompt()}],
-		tools: TOOL_SCHEMAS,
+		system: systemPrompt(),
+		tools: ANTHROPIC_TOOLS,
 	}).length;
 
 	const timing = (): AgentTiming => ({
@@ -457,6 +393,7 @@ export async function runAgent(
 		prefixChars,
 		totalRequestChars: requestChars.reduce((a, b) => a + b, 0),
 		rateLimitRetries,
+		cacheReadTokens,
 	});
 
 	const usage = (): AgentUsage => ({promptTokens, completionTokens, callsMissingUsage});
@@ -470,15 +407,16 @@ export async function runAgent(
 
 	/** Wraps every model call so no timing path can be forgotten. */
 	const timedCall = async (
-		msgs: ApiMessage[],
+		msgs: Anthropic.MessageParam[],
 		withTools = true,
-	): Promise<ApiMessage> => {
+	): Promise<Anthropic.Message> => {
 		const t0 = Date.now();
 		const stats: CallStats = {
 			requestChars: 0,
 			rateLimitRetries: 0,
 			promptTokens: null,
 			completionTokens: null,
+			cacheReadTokens: 0,
 		};
 		try {
 			return await callModel(msgs, apiKey, model, signal, withTools, stats);
@@ -487,6 +425,7 @@ export async function runAgent(
 			modelMs.push(Date.now() - t0);
 			requestChars.push(stats.requestChars);
 			rateLimitRetries += stats.rateLimitRetries;
+			cacheReadTokens += stats.cacheReadTokens;
 
 			// Summed across calls, but a missing report must not silently read as zero: totals stay
 			// null until at least one call reports, and every gap is counted so the total can be
@@ -504,9 +443,11 @@ export async function runAgent(
 		iterations++;
 		const message = await timedCall(messages);
 
-		const toolCalls = message.tool_calls ?? [];
+		const toolCalls = message.content.filter(
+			(b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
+		);
 		if (toolCalls.length === 0) {
-			const reply = message.content?.trim() || "I could not produce an answer for that.";
+			const reply = textOf(message) || "I could not produce an answer for that.";
 			return {
 				reply,
 				...withRequiredContext(reply),
@@ -521,26 +462,28 @@ export async function runAgent(
 
 		// The assistant turn carrying the tool calls must be preserved verbatim, or the tool results
 		// that follow have nothing to attach to.
-		messages.push({
-			role: "assistant",
-			content: message.content ?? null,
-			tool_calls: toolCalls,
-		});
+		messages.push({role: "assistant", content: message.content});
+
+		/*
+		 * Every result from this turn goes back in ONE user message. Splitting them across several
+		 * messages is accepted by the API but teaches the model to stop calling tools in parallel,
+		 * which costs an extra round trip on any question that touches two airports.
+		 */
+		const toolResults: Anthropic.ToolResultBlockParam[] = [];
 
 		for (const call of toolCalls) {
 			const started = Date.now();
-			const {args, error} = parseArgs(call.function.arguments);
-
-			const result = error
-				? {ok: false as const, code: "invalid_parameters" as const, message: error}
-				: dispatchTool(call.function.name, args);
+			// `input` arrives already parsed, so there is no JSON string to decode and no parse
+			// error to handle — dispatchTool still validates every parameter.
+			const args = (call.input ?? {}) as Record<string, unknown>;
+			const result = dispatchTool(call.name, args);
 
 			if (result.ok && result.mustMention) collectedMustMention.push(...result.mustMention);
 
-			const payload = payloadFor(call.function.name, result);
+			const payload = payloadFor(call.name, result);
 
 			trace.push({
-				name: call.function.name,
+				name: call.name,
 				arguments: args,
 				ok: result.ok,
 				...(result.ok ? {} : {errorCode: result.code}),
@@ -548,13 +491,15 @@ export async function runAgent(
 				...(payload ? {payload} : {}),
 			});
 
-			messages.push({
-				role: "tool",
-				tool_call_id: call.id,
-				name: call.function.name,
+			toolResults.push({
+				type: "tool_result",
+				tool_use_id: call.id,
 				content: JSON.stringify(compactForModel(result)),
+				...(result.ok ? {} : {is_error: true}),
 			});
 		}
+
+		messages.push({role: "user", content: toolResults});
 	}
 
 	// Cap reached. Ask once for a final answer with no tools, rather than returning nothing.
@@ -572,7 +517,7 @@ export async function runAgent(
 	);
 
 	const closingReply =
-		closing.content?.trim() ||
+		textOf(closing) ||
 		"I gathered data but could not complete an answer within the step limit.";
 
 	return {

@@ -166,10 +166,10 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (needModel.length > 0 && !process.env.GROQ_API_KEY) {
+  if (needModel.length > 0 && !process.env.ANTHROPIC_API_KEY) {
     // Same guard as the eval runner. Without it the job "succeeds" while writing abstentions that
     // look like the model having declined, which is a lie the dashboard would then repeat.
-    console.error("GROQ_API_KEY is not set — the model stage would abstain on everything.");
+    console.error("ANTHROPIC_API_KEY is not set — the model stage would abstain on everything.");
     process.exit(1);
   }
 

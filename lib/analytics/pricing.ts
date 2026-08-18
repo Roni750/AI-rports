@@ -23,21 +23,20 @@ export interface ModelPrice {
 }
 
 /**
- * Checked against https://console.groq.com/docs/models on this date.
+ * Checked against https://platform.claude.com/docs/en/pricing on this date.
  *
  * Re-check it when a model is added. Groq has already removed a whole model family once during
  * this project's lifetime (the Llama 3.x line, which is why `DEFAULT_MODEL` is overridable), so
  * treating this table as permanent would be a mistake.
  */
-export const PRICES_CHECKED_ON = "2026-08-17";
+export const PRICES_CHECKED_ON = "2026-08-18";
 
 export const MODEL_PRICES: Readonly<Record<string, ModelPrice>> = {
-  "openai/gpt-oss-120b": { inputPerMTokenUsd: 0.15, outputPerMTokenUsd: 0.6 },
-  "openai/gpt-oss-20b": { inputPerMTokenUsd: 0.075, outputPerMTokenUsd: 0.3 },
-  "openai/gpt-oss-safeguard-20b": { inputPerMTokenUsd: 0.075, outputPerMTokenUsd: 0.3 },
-  "qwen/qwen3.6-27b": { inputPerMTokenUsd: 0.6, outputPerMTokenUsd: 3.0 },
-  // Deliberately absent: groq/compound and groq/compound-mini, which Groq lists without a price.
-  // Absent means "we do not know", which is a different and more useful claim than zero.
+  "claude-opus-5": { inputPerMTokenUsd: 5.0, outputPerMTokenUsd: 25.0 },
+  // Introductory pricing, in effect through 2026-08-31. Reverts to 3.00 / 15.00 after that —
+  // a cost figure computed here in September would be ~35% low until this line is updated.
+  "claude-sonnet-5": { inputPerMTokenUsd: 2.0, outputPerMTokenUsd: 10.0 },
+  "claude-haiku-4-5": { inputPerMTokenUsd: 1.0, outputPerMTokenUsd: 5.0 },
 };
 
 const PER_MILLION = 1_000_000;

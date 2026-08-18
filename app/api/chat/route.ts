@@ -131,7 +131,7 @@ export async function POST(request: Request) {
 
   try {
     const result = await runAgent(parsed, {
-      apiKey: process.env.GROQ_API_KEY ?? "",
+      apiKey: process.env.ANTHROPIC_API_KEY ?? "",
       signal: request.signal,
     });
 
@@ -171,7 +171,7 @@ export async function POST(request: Request) {
       recordTurn({
         ...baseRecord,
         replyChars: 0,
-        // DEFAULT_MODEL, not the env var: GROQ_MODEL is an optional override and is normally
+        // DEFAULT_MODEL, not the env var: ANTHROPIC_MODEL is an optional override and is normally
         // unset, so reading it directly recorded every failed turn as "unknown" — losing the
         // attribution on exactly the rows where "which model failed?" is the question.
         model: DEFAULT_MODEL,

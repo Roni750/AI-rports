@@ -45,9 +45,9 @@ async function main(): Promise<void> {
   // this guard the run still completes and still prints a report — one that looks like a model
   // declining to classify, when in fact no request was ever made. A measurement tool that fails
   // quietly is worse than one that fails.
-  if (useHybrid && !process.env.GROQ_API_KEY) {
+  if (useHybrid && !process.env.ANTHROPIC_API_KEY) {
     console.error(
-      "--hybrid needs GROQ_API_KEY (checked the environment and .env.local).\n" +
+      "--hybrid needs ANTHROPIC_API_KEY (checked the environment and .env.local).\n" +
         "Without it the LLM stage abstains on everything and the report is misleading.\n" +
         "Run without --hybrid to score the deterministic stage alone.",
     );

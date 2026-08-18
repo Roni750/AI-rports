@@ -1,3 +1,5 @@
+import Anthropic from "@anthropic-ai/sdk";
+
 import { CLASSIFIER_MODEL, MIN_CONFIDENCE } from "./classifier-version";
 import { costUsd } from "./pricing";
 import { CLASSIFIABLE_TOPIC_IDS, isTopicId, TOPICS, UNCLASSIFIED } from "./taxonomy";
@@ -21,7 +23,6 @@ import { CLASSIFIABLE_TOPIC_IDS, isTopicId, TOPICS, UNCLASSIFIED } from "./taxon
  * retryable and idempotent. The cost is real and priced: see the eval's `costUsdPer1000`.
  */
 
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 
 export interface LlmClassification {
   topicId: string;
@@ -76,10 +77,10 @@ Rules:
 export async function classifyWithModel(
   prompt: string,
   toolsInvoked: readonly string[],
-  apiKey = process.env.GROQ_API_KEY ?? "",
+  apiKey = process.env.ANTHROPIC_API_KEY ?? "",
 ): Promise<LlmClassification> {
   if (!apiKey) {
-    return failed("no GROQ_API_KEY configured");
+    return failed("no ANTHROPIC_API_KEY configured");
   }
 
   const user =
@@ -134,50 +135,56 @@ async function attemptOnce(user: string, apiKey: string): Promise<Attempt> {
   });
 
   try {
-    const res = await fetch(GROQ_URL, {
-      method: "POST",
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: CLASSIFIER_MODEL,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: user },
-        ],
-        // Classification should be as close to deterministic as the provider allows. Note that
-        // temperature 0 reduces variance without guaranteeing identical outputs, which is exactly
-        // why labels are versioned and predictions are frozen for CI rather than recomputed.
-        temperature: 0,
-        max_tokens: 120,
-        response_format: { type: "json_object" },
-      }),
-    });
-
-    if (!res.ok) {
+    const client = new Anthropic({ apiKey, maxRetries: 0 });
+    let message: Anthropic.Message;
+    try {
+      message = await client.messages.create(
+        {
+          model: CLASSIFIER_MODEL,
+          system: SYSTEM_PROMPT,
+          messages: [{ role: "user", content: user }],
+          /*
+           * No `temperature` — sampling parameters are rejected on current models. Determinism was
+           * never guaranteed by temperature 0 anyway, which is exactly why labels are versioned and
+           * predictions are frozen for CI rather than recomputed.
+           *
+           * Thinking is off and effort is low: this is a single-label classification with no tools,
+           * so the failure mode that makes disabling thinking risky for the agent (a tool call
+           * emitted as plain text) cannot arise here, and the batch stays fast and cheap.
+           */
+          max_tokens: 1000,
+          thinking: { type: "disabled" },
+          output_config: { effort: "low" },
+        },
+        { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) },
+      );
+    } catch (err) {
       // The provider decided nothing here, so this is not an abstention to record. Surface a 429
       // separately: it is the one status the retry loop above can actually do something about.
-      const hint = Number(res.headers.get("retry-after") ?? res.headers.get("x-ratelimit-reset-tokens"));
+      const status = err instanceof Anthropic.APIError ? (err.status ?? 0) : 0;
+      const hint = Number(
+        err instanceof Anthropic.APIError ? (err.headers?.get?.("retry-after") ?? NaN) : NaN,
+      );
       return {
-        classification: failed(`provider returned ${res.status}`),
-        rateLimited: res.status === 429,
+        classification: failed(`provider returned ${status || "a transport error"}`),
+        rateLimited: status === 429,
         retryAfterSeconds: Number.isFinite(hint) ? hint : null,
       };
     }
 
-    const json = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
-      usage?: { prompt_tokens?: number; completion_tokens?: number };
-    };
-
-    const content = json.choices?.[0]?.message?.content;
-    // A 200 with no content is a provider defect, not a judgement about the prompt.
-    if (!content) return settled(failed("empty response"));
-
     const cost = costUsd(
       CLASSIFIER_MODEL,
-      json.usage?.prompt_tokens ?? null,
-      json.usage?.completion_tokens ?? null,
+      message.usage.input_tokens ?? null,
+      message.usage.output_tokens ?? null,
     );
+
+    const content = message.content
+      .filter((b): b is Anthropic.TextBlock => b.type === "text")
+      .map((b) => b.text)
+      .join("")
+      .trim();
+    // A 200 with no content is a provider defect, not a judgement about the prompt.
+    if (!content) return settled(failed("empty response"));
 
     let parsed: { topic_id?: unknown; confidence?: unknown; reason?: unknown };
     try {

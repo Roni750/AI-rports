@@ -2,11 +2,12 @@
  * List the models the configured Groq key can actually use.
  *
  * Exists because provider model names change and get deprecated. When the chat route reports that a
- * model was rejected, this says what to put in GROQ_MODEL instead.
+ * model was rejected, this says what to put in ANTHROPIC_MODEL instead.
  *
  * Run: npm run models
  */
 
+import Anthropic from "@anthropic-ai/sdk";
 import  fs from "node:fs";
 import path from "node:path";
 
@@ -27,46 +28,41 @@ function loadEnvLocal() {
 async function main() {
   loadEnvLocal();
 
-  const key = process.env.GROQ_API_KEY;
+  const key = process.env.ANTHROPIC_API_KEY;
   if (!key) {
-    console.error("No GROQ_API_KEY found.");
-    console.error("Create airport-agent/.env.local containing:  GROQ_API_KEY=gsk_...");
+    console.error("No ANTHROPIC_API_KEY found.");
+    console.error("Create airport-agent/.env.local containing:  ANTHROPIC_API_KEY=sk-ant-...");
     return 1;
   }
 
-  const res = await fetch("https://api.groq.com/openai/v1/models", {
-    headers: { Authorization: `Bearer ${key}` },
-  });
+  const client = new Anthropic({ apiKey: key });
 
-  if (!res.ok) {
-    console.error(`Groq returned ${res.status}: ${await res.text()}`);
-    if (res.status === 401) console.error("The key was rejected — check it was copied in full.");
+  const models: { id: string; name: string; ctx: number }[] = [];
+  try {
+    for await (const m of client.models.list()) {
+      models.push({ id: m.id, name: m.display_name, ctx: m.max_input_tokens ?? 0 });
+    }
+  } catch (err) {
+    if (err instanceof Anthropic.AuthenticationError) {
+      console.error("The key was rejected — check it was copied in full.");
+    } else {
+      console.error(err instanceof Error ? err.message : String(err));
+    }
     return 1;
   }
 
-  const json = (await res.json()) as {
-    data?: { id: string; owned_by?: string; context_window?: number; active?: boolean }[];
-  };
-
-  const models = (json.data ?? []).filter((m) => m.active !== false);
   models.sort((a, b) => a.id.localeCompare(b.id));
 
-  console.log(`${models.length} models available:\n`);
+  console.log(`${models.length} models available to this key:
+`);
   for (const m of models) {
-    const ctx = m.context_window ? `${(m.context_window / 1000).toFixed(0)}k ctx` : "";
-    console.log(`  ${m.id.padEnd(42)} ${(m.owned_by ?? "").padEnd(16)} ${ctx}`);
+    const ctx = m.ctx ? `${(m.ctx / 1000).toFixed(0)}k ctx` : "";
+    console.log(`  ${m.id.padEnd(24)} ${m.name.padEnd(26)} ${ctx}`);
   }
 
-  // Tool calling is required, so flag the families known to support it well.
-  const preferred = models.filter((m) =>
-    /llama-3\.[13]|llama-4|gpt-oss|qwen|kimi|maverick|scout/i.test(m.id),
-  );
-  if (preferred.length) {
-    console.log("\nLikely tool-calling candidates for GROQ_MODEL:");
-    for (const m of preferred) console.log(`  ${m.id}`);
-  }
+
   console.log(
-    `\nCurrently configured: GROQ_MODEL=${process.env.GROQ_MODEL ?? "(unset, using code default)"}`,
+    `\nCurrently configured: ANTHROPIC_MODEL=${process.env.ANTHROPIC_MODEL ?? "(unset, using code default)"}`,
   );
   return 0;
 }

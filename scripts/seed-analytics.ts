@@ -60,9 +60,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  const apiKey = process.env.GROQ_API_KEY ?? "";
+  const apiKey = process.env.ANTHROPIC_API_KEY ?? "";
   if (!apiKey) {
-    console.error("GROQ_API_KEY is not set (checked the environment and .env.local).");
+    console.error("ANTHROPIC_API_KEY is not set (checked the environment and .env.local).");
     process.exit(1);
   }
 
@@ -129,7 +129,7 @@ async function main(): Promise<void> {
         await recordTurn({
           ...base,
           replyChars: 0,
-          // DEFAULT_MODEL, not the env var. GROQ_MODEL is an optional override and is normally
+          // DEFAULT_MODEL, not the env var. ANTHROPIC_MODEL is an optional override and is normally
           // unset, so reading it directly recorded every failed turn as "unknown" — losing the
           // attribution on exactly the rows where "which model failed?" is the question. The chat
           // route was fixed for this; the seeder is the other call site and needs the same value.

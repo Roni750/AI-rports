@@ -60,7 +60,7 @@ function turn(over: Partial<TurnRecord> & { sessionId: string; turnIndex: number
     prompt: "which airports in New England are candidates",
     replyChars: 200,
     historyTurns: 0,
-    model: "openai/gpt-oss-120b",
+    model: "claude-opus-5",
     iterations: 2,
     modelCalls: 2,
     promptTokens: 1000,
@@ -94,10 +94,10 @@ describe("overview", () => {
     expect(result.data.sessions).toBe(2);
     expect(result.data.turnsPerSession).toBeCloseTo(1.5, 6);
 
-    // 1000 prompt + 200 completion on gpt-oss-120b at $0.15/$0.60 per 1M
-    // = 0.00015 + 0.00012 = 0.00027 per turn, 0.00081 across three.
-    expect(result.data.meanCostUsd).toBeCloseTo(0.00027, 8);
-    expect(result.data.totalCostUsd).toBeCloseTo(0.00081, 8);
+    // 1000 prompt + 200 completion on claude-opus-5 at $5.00/$25.00 per 1M
+    // = 0.005 + 0.005 = 0.01 per turn, 0.03 across three.
+    expect(result.data.meanCostUsd).toBeCloseTo(0.01, 8);
+    expect(result.data.totalCostUsd).toBeCloseTo(0.03, 8);
     expect(result.data.unpricedTurns).toBe(0);
   });
 
@@ -297,7 +297,7 @@ describe("recentSessions", () => {
     expect(result.data).toHaveLength(1);
     expect(result.data[0].turns).toBe(2);
     expect(result.data[0].topics.sort()).toEqual(["cargo_freight", "screening_ranking"]);
-    expect(result.data[0].totalCostUsd).toBeCloseTo(0.00054, 8);
+    expect(result.data[0].totalCostUsd).toBeCloseTo(0.02, 8);
   });
 
   it("records the taxonomy version alongside the label", async () => {

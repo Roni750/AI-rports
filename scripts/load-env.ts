@@ -5,7 +5,7 @@ import path from "node:path";
  * Minimal .env.local reader for scripts that run outside Next.
  *
  * Next loads `.env.local` automatically; `tsx` does not. Without this, a script that needs
- * GROQ_API_KEY does not fail loudly — it takes the "no key configured" branch and produces
+ * ANTHROPIC_API_KEY does not fail loudly — it takes the "no key configured" branch and produces
  * plausible but empty results. That is exactly how the topic eval was briefly reporting a working
  * LLM stage that had never made a request, so this is not a convenience wrapper.
  *
