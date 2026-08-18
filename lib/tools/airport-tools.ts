@@ -8,7 +8,9 @@ import {
 	loadScoringInputs,
 } from "../data/db";
 import {
+	COMPONENT_LABELS,
 	DATA_PROVENANCE,
+	DEFAULT_WEIGHTS,
 	HAUL_BANDS,
 	METRO_GROUPS,
 	NEW_ENGLAND_STATES,
@@ -17,6 +19,7 @@ import {
 import {assessRobustness, describeWeights} from "../scoring/robustness";
 import {scoreAirports} from "../scoring/score";
 import type {Cohort, ScoredAirport, Weights} from "../scoring/types";
+import type {MustMention} from "./must-mention";
 import {fail, ok, type ResultEnvelope, type ToolResult} from "./types";
 
 /**
@@ -33,6 +36,118 @@ import {fail, ok, type ResultEnvelope, type ToolResult} from "./types";
  * Scoring inputs are loaded once and cached: percentiles require the whole population, and the
  * dataset is a few hundred rows.
  */
+
+// --------------------------------------------------------------- tool-layer tunables
+//
+// Every judgement call the tool surface makes lives here, for the same reason the scoring model
+// keeps its own in `lib/scoring/config.ts`: a reviewer should be able to read the whole value
+// system at once and challenge it, rather than meeting a bare `88` inside a filter and having to
+// work out what it decided.
+//
+// Nothing here changes a score. These govern how much of a result is returned, when a query is
+// too ambiguous to answer, and when a pattern is pronounced enough to be worth writing a sentence
+// about. Scoring parameters — weights, cohorts, shrinkage, haul bands — are imported above and
+// are never redefined in this file.
+
+/** Search breadth and the point at which a query stops being genuinely ambiguous. */
+const SEARCH = {
+	/** Candidates fetched before disambiguating: wide enough to see every airport in a metro. */
+	maxCandidates: 12,
+	/** Readings offered back when the candidates really are comparable. */
+	maxInterpretations: 6,
+	/** Runner-up airports named in the note when one match dominates outright. */
+	maxAlternativesNamed: 3,
+	/** Nearby codes suggested when an airport has no data for the current year. */
+	maxSuggestions: 5,
+	/**
+	 * Resolve outright when the busiest match carries at least this many times the passengers of
+	 * the runner-up.
+	 *
+	 * "Anchorage" matches ANC (2.66m passengers) and Merrill Field (1,416). Asking the user to
+	 * choose between those is not careful, it is obtuse — nobody asking about Anchorage means the
+	 * general-aviation field. Genuinely ambiguous cases fall below the factor and are asked about.
+	 */
+	dominanceFactor: 10,
+} as const;
+
+/** Bounds on a ranking request. The cap exists so one call cannot swamp the model's context. */
+const RANKING = {
+	defaultLimit: 5,
+	minLimit: 1,
+	maxLimit: 25,
+} as const;
+
+const COMPARISON = {
+	/** Fewer than two airports is not a comparison. */
+	minAirports: 2,
+	/** More than this stops being a comparison and becomes a ranking — use rankAirports instead. */
+	maxAirports: 6,
+	/** A highest-versus-lowest observation needs two sides before it says anything. */
+	minRowsForContrast: 2,
+} as const;
+
+/**
+ * Percentile thresholds that decide when a component profile is worth remarking on.
+ *
+ * Editorial rather than statistical: they choose when a pattern is pronounced enough that an
+ * analyst would mention it unprompted. Named so that editorial line is visible and arguable in one
+ * place instead of being scattered through a chain of conditionals.
+ */
+const PROFILE_THRESHOLDS = {
+	/** One component clearly high while the other is clearly low — a divergent profile. */
+	high: 80,
+	low: 30,
+	/** Both components elevated. A lower bar, because both have to clear it. */
+	bothElevated: 70,
+	/** Load factor high enough to be worth calling out on its own. */
+	loadFactorNotable: 85,
+} as const;
+
+const SEASONALITY = {
+	/** Months of usable delay data before a seasonal swing is a pattern rather than an accident. */
+	minMonths: 6,
+	/** Worst-to-best ratio above which the swing is the story, not noise. */
+	notableSwingRatio: 3,
+} as const;
+
+const FLIGHT_MIX = {
+	/** Routes pulled before filtering — comfortably above the busiest US airport's route count. */
+	routeSampleSize: 400,
+	topRoutesShown: 10,
+	constrainedRoutesShown: 8,
+} as const;
+
+/**
+ * What makes a route "constrained": nearly full, on enough traffic that the figure is not noise.
+ *
+ * Both halves matter. A 100% load factor over 300 annual passengers is one well-timed aircraft,
+ * not evidence of demand pressing against capacity.
+ */
+const CONSTRAINED_ROUTE = {
+	minLoadFactorPct: 88,
+	minPassengers: 20_000,
+} as const;
+
+/** The unit the freight note is written in, so the threshold and the display agree by construction. */
+const LBS_PER_BILLION = 1_000_000_000;
+
+/**
+ * Freight above this dwarfs the passenger business, which changes how a passenger-only percentage
+ * should be read. Anchorage moved 5.75 billion pounds against 2.66 million passengers.
+ */
+const FREIGHT_HUB_MIN_LBS = 1 * LBS_PER_BILLION;
+
+/**
+ * Delay coverage, stated as a caveat on every result.
+ *
+ * A property of the committed dataset rather than of any request, so it is a constant — but it is
+ * a constant that silently goes stale if the data is rebuilt, which is exactly why it is named
+ * here rather than typed into a sentence. Derive it from the data when the pipeline can report it.
+ */
+const DELAY_COVERAGE = {
+	airportsCovered: 195,
+	airportsTotal: 728,
+} as const;
 
 let cachedInputs: ReturnType<typeof loadScoringInputs> | null = null;
 
@@ -62,7 +177,9 @@ const VINTAGE = `BTS T-100 + On-Time Performance; ${DATA_PROVENANCE.years.join("
 
 const BASE_ASSUMPTIONS = ["Scheduled passenger service only; cargo counted separately."];
 
-const BASE_CAVEATS = ["Delay figures cover larger reporting carriers only (195 of 728 airports)."];
+const BASE_CAVEATS = [
+	`Delay figures cover larger reporting carriers only (${DELAY_COVERAGE.airportsCovered} of ${DELAY_COVERAGE.airportsTotal} airports).`,
+];
 
 function envelope(over: Partial<ResultEnvelope> = {}): ResultEnvelope {
 	return {
@@ -142,6 +259,29 @@ function metroFor(iata: string) {
 	return null;
 }
 
+/**
+ * The metro relationship as a required fact, keyed on the metro rather than on the tool.
+ *
+ * Attaching this to one tool was a design error: a comparison the model assembles from two
+ * getAirportMetrics calls instead of compareAirports never touched the emitting tool, so an answer
+ * could put LAX beside SNA without ever saying they serve one market. The fact belongs to the
+ * airport, so every tool that returns an airport emits it — and the key makes saying it twice
+ * impossible rather than merely unlikely.
+ */
+function metroMustMention(iata: string): MustMention[] {
+	const metro = metroFor(iata);
+	if (!metro) return [];
+	return [
+		{
+			key: `metro:${metro.key}`,
+			priority: "important",
+			text:
+				`${iata} is part of ${metro.label}, alongside ${metro.siblingAirports.join(", ")}. ` +
+				`Airports in one metro share a catchment area and partly compete for the same passengers.`,
+		},
+	];
+}
+
 export function resolveAirport(query: string): ToolResult<ResolveResult> {
 	const raw = query.trim();
 	if (!raw) return fail("invalid_parameters", "No airport name or code was provided.");
@@ -179,7 +319,7 @@ export function resolveAirport(query: string): ToolResult<ResolveResult> {
 		);
 	}
 
-	const matches = findAirports(raw, 12);
+	const matches = findAirports(raw, SEARCH.maxCandidates);
 	if (matches.length === 0) {
 		return fail(
 			"airport_not_found",
@@ -193,30 +333,22 @@ export function resolveAirport(query: string): ToolResult<ResolveResult> {
 	// findAirports already orders by passengers descending.
 	const chosen = exact ?? matches[0];
 
-	/**
-	 * Only treat multiple matches as a real ambiguity when the candidates are actually comparable.
-	 *
-	 * "Anchorage" matches ANC (2.66m passengers) and Merrill Field (1,416). Asking the user to
-	 * choose between those is not careful, it is obtuse — nobody asking about Anchorage means the
-	 * general-aviation field. But "compare LA and Santa Ana" IS genuinely ambiguous, and metro
-	 * aliases are handled above precisely because they always are.
-	 *
-	 * So: if the busiest match dominates the runner-up by this factor, resolve to it and mention the
-	 * alternative in a note rather than blocking on a question.
-	 */
-	const DOMINANCE_FACTOR = 10;
+	// Only treat multiple matches as a real ambiguity when the candidates are actually comparable —
+	// see SEARCH.dominanceFactor. "compare LA and Santa Ana" IS genuinely ambiguous, and metro
+	// aliases are handled above precisely because they always are.
 	const notes: string[] = [];
 
 	if (!exact && matches.length > 1) {
 		const [first, second] = matches;
 		const dominates =
-			second.passengers <= 0 || first.passengers / Math.max(second.passengers, 1) >= DOMINANCE_FACTOR;
+			second.passengers <= 0 ||
+			first.passengers / Math.max(second.passengers, 1) >= SEARCH.dominanceFactor;
 
 		if (!dominates) {
 			return ok(
 				{
 					kind: "ambiguous",
-					interpretations: matches.slice(0, 6).map((m) => ({
+					interpretations: matches.slice(0, SEARCH.maxInterpretations).map((m) => ({
 						label: `${m.iata} — ${m.city ?? "unknown city"}`,
 						airports: [m.iata],
 						description: `${Math.round(m.passengers).toLocaleString("en-US")} scheduled passengers in ${YEARS.current}.`,
@@ -230,7 +362,7 @@ export function resolveAirport(query: string): ToolResult<ResolveResult> {
 		}
 
 		const alternatives = matches
-			.slice(1, 4)
+			.slice(1, 1 + SEARCH.maxAlternativesNamed)
 			.map((m) => `${m.iata} (${Math.round(m.passengers).toLocaleString("en-US")} passengers)`);
 		notes.push(
 			`Interpreted "${raw}" as ${first.iata}, by far the busiest match with ` +
@@ -304,7 +436,7 @@ export function getAirportMetrics(iata: string): ToolResult<AirportMetricsResult
 	const current = history.find((h) => h.year === YEARS.current);
 
 	if (!current) {
-		const alt = findAirports(code, 5);
+		const alt = findAirports(code, SEARCH.maxSuggestions);
 		return fail(
 			"no_data_for_airport",
 			`No ${YEARS.current} scheduled passenger service found for ${code}.`,
@@ -372,6 +504,9 @@ export function getAirportMetrics(iata: string): ToolResult<AirportMetricsResult
 				`Haul bands are our convention, not an industry standard: short under ${HAUL_BANDS.shortMaxMiles} miles, long at or above ${HAUL_BANDS.longMinMiles} miles.`,
 			],
 			caveats,
+			// Emitted here as well as by compareAirports: the model often assembles a comparison from
+			// two of these calls, and the relationship matters just as much in that shape.
+			...(metroMustMention(code).length > 0 ? {mustMention: metroMustMention(code)} : {}),
 			confidence: delay ? "high" : "medium",
 		}),
 	);
@@ -411,7 +546,10 @@ export interface RankAirportsResult {
 }
 
 export function rankAirports(params: RankAirportsParams = {}): ToolResult<RankAirportsResult> {
-	const limit = Math.min(Math.max(params.limit ?? 5, 1), 25);
+	const limit = Math.min(
+		Math.max(params.limit ?? RANKING.defaultLimit, RANKING.minLimit),
+		RANKING.maxLimit,
+	);
 
 	const states =
 		params.region === "new_england"
@@ -492,13 +630,10 @@ export function rankAirports(params: RankAirportsParams = {}): ToolResult<RankAi
 					topComponent: strongest.key,
 				};
 			}),
-			weightsUsed: describeWeights({
-				demandPressure: 0.3,
-				capacityStrain: 0.25,
-				growthMomentum: 0.25,
-				frequencyConstraint: 0.2,
-				...params.weights,
-			} as Weights),
+			// Spread the real defaults rather than restating them: a second copy of the weights would
+			// keep type-checking after DEFAULT_WEIGHTS changed, and this string is the label telling
+			// the reader which weighting produced the ranking. It has to be the weighting.
+			weightsUsed: describeWeights({...DEFAULT_WEIGHTS, ...params.weights}),
 			robustnessNote: robustness.note,
 			populationSize: population,
 			cohortsIncluded,
@@ -512,13 +647,21 @@ export function rankAirports(params: RankAirportsParams = {}): ToolResult<RankAi
 			// A ranking without its stability is an overstatement of what the model knows, so the note
 			// is mandatory. Same for the cross-cohort warning, which changes what the numbers mean.
 			mustMention: [
-				robustness.note,
+				// Cross-cohort first: it changes what the numbers mean, where robustness only says how
+				// far to trust the order.
 				...(cohortsIncluded.length > 1
 					? [
-						`This list spans several size cohorts (${cohortsIncluded.join(", ")}); scores are only comparable within a cohort.`,
+						{
+							key: "cross-cohort",
+							priority: "critical" as const,
+							text: `This list spans several size cohorts (${cohortsIncluded.join(", ")}); scores are only comparable within a cohort.`,
+						},
 					]
 					: []),
-			].filter((s) => s.length > 0),
+				...(robustness.note
+					? [{key: "robustness", priority: "important" as const, text: robustness.note}]
+					: []),
+			],
 			confidence: "medium",
 		}),
 	);
@@ -549,11 +692,17 @@ export interface CompareResult {
 
 export function compareAirports(codes: string[]): ToolResult<CompareResult> {
 	const wanted = [...new Set(codes.map((c) => c.trim().toUpperCase()))].filter(Boolean);
-	if (wanted.length < 2) {
-		return fail("invalid_parameters", "Comparing needs at least two airport codes.");
+	if (wanted.length < COMPARISON.minAirports) {
+		return fail(
+			"invalid_parameters",
+			`Comparing needs at least ${COMPARISON.minAirports} airport codes.`,
+		);
 	}
-	if (wanted.length > 6) {
-		return fail("invalid_parameters", "Comparing is limited to six airports at a time.");
+	if (wanted.length > COMPARISON.maxAirports) {
+		return fail(
+			"invalid_parameters",
+			`Comparing is limited to ${COMPARISON.maxAirports} airports at a time.`,
+		);
 	}
 
 	const rows: ComparisonRow[] = [];
@@ -580,7 +729,7 @@ export function compareAirports(codes: string[]): ToolResult<CompareResult> {
 		});
 	}
 
-	if (rows.length < 2) {
+	if (rows.length < COMPARISON.minAirports) {
 		return fail(
 			"no_data_for_airport",
 			`Could not find data for ${missing.join(", ")}.`,
@@ -603,6 +752,8 @@ export function compareAirports(codes: string[]): ToolResult<CompareResult> {
 	// question from comparing two independent markets, and the user should know which they asked.
 	// Reported once per metro, not once per airport, or a two-airport comparison says it twice.
 	const reportedMetros = new Set<string>();
+	/** Metro keys seen here, so the required fact is keyed on the metro rather than on its wording. */
+	const metroKeys: string[] = [];
 	for (const a of rows) {
 		const metro = metroFor(a.iata);
 		if (!metro || reportedMetros.has(metro.key)) continue;
@@ -611,6 +762,7 @@ export function compareAirports(codes: string[]): ToolResult<CompareResult> {
 		);
 		if (together.length > 1) {
 			reportedMetros.add(metro.key);
+			metroKeys.push(metro.key);
 			const codes = together.map((t) => t.iata);
 			const joined =
 				codes.length === 2
@@ -624,7 +776,7 @@ export function compareAirports(codes: string[]): ToolResult<CompareResult> {
 	}
 
 	const withLf = rows.filter((r) => r.loadFactorPct !== null);
-	if (withLf.length >= 2) {
+	if (withLf.length >= COMPARISON.minRowsForContrast) {
 		const hi = withLf.reduce((a, b) => (b.loadFactorPct! > a.loadFactorPct! ? b : a));
 		const lo = withLf.reduce((a, b) => (b.loadFactorPct! < a.loadFactorPct! ? b : a));
 		observations.push(
@@ -633,7 +785,7 @@ export function compareAirports(codes: string[]): ToolResult<CompareResult> {
 	}
 
 	const withDelay = rows.filter((r) => r.nasDelayMinPerArrival !== null);
-	if (withDelay.length >= 2) {
+	if (withDelay.length >= COMPARISON.minRowsForContrast) {
 		const hi = withDelay.reduce((a, b) =>
 			b.nasDelayMinPerArrival! > a.nasDelayMinPerArrival! ? b : a,
 		);
@@ -660,9 +812,25 @@ export function compareAirports(codes: string[]): ToolResult<CompareResult> {
 
 	// Whether the airports share a market, and whether their scores are comparable, both change what
 	// the comparison means. Required rather than offered.
-	const required = observations.filter((o) =>
-		/share a catchment area|not directly comparable/.test(o),
-	);
+	//
+	// Keyed by the fact rather than by this tool, so a metro relationship another tool reported in
+	// the same turn is not said twice.
+	//
+	// The metro key comes from METRO_GROUPS via metroKeys, NOT from parsing the sentence back out.
+	// An earlier version recovered it with a regex over its own prose and produced
+	// "metro:greater los angeles" where getAirportMetrics produced "metro:los_angeles" — two keys
+	// for one fact, which defeats the deduplication entirely.
+	let metroIndex = 0;
+	const required: MustMention[] = observations.flatMap((o): MustMention[] => {
+		if (/not directly comparable/.test(o)) {
+			return [{key: "cross-cohort", priority: "critical", text: o}];
+		}
+		if (/share a catchment area/.test(o)) {
+			const key = metroKeys[metroIndex++] ?? "unknown";
+			return [{key: `metro:${key}`, priority: "important", text: o}];
+		}
+		return [];
+	});
 
 	return ok(
 		{rows, observations, sameCohort},
@@ -705,12 +873,10 @@ export interface ExplainScoreResult {
 	interpretation: string[];
 }
 
-const PLAIN_LABELS: Record<string, string> = {
-	demandPressure: "how full the planes are",
-	capacityStrain: "airport-caused delays",
-	growthMomentum: "passenger growth",
-	frequencyConstraint: "bigger planes rather than more flights",
-};
+/** A percentile read as a share from the top: the 92nd percentile is the top 8%. */
+function topSharePct(percentile: number): number {
+	return 100 - percentile;
+}
 
 export function explainScore(iata: string): ToolResult<ExplainScoreResult> {
 	const code = iata.trim().toUpperCase();
@@ -726,7 +892,7 @@ export function explainScore(iata: string): ToolResult<ExplainScoreResult> {
 	const months = loadDelayMonths(code);
 	let seasonality: ExplainScoreResult["seasonality"] = null;
 	const usable = months.filter((m) => m.nasDelayMinPerArrival !== null && m.arrFlights > 0);
-	if (usable.length >= 6) {
+	if (usable.length >= SEASONALITY.minMonths) {
 		const worst = usable.reduce((a, b) =>
 			b.nasDelayMinPerArrival! > a.nasDelayMinPerArrival! ? b : a,
 		);
@@ -754,30 +920,39 @@ export function explainScore(iata: string): ToolResult<ExplainScoreResult> {
 	const demand = byKey.get("demandPressure");
 
 	if (strain?.percentile != null && growth?.percentile != null) {
-		if (strain.percentile > 80 && growth.percentile < 30) {
+		if (
+			strain.percentile > PROFILE_THRESHOLDS.high &&
+			growth.percentile < PROFILE_THRESHOLDS.low
+		) {
 			interpretation.push(
 				`${code} is heavily congested but not growing. That points to capacity being suppressed ` +
 				`rather than demand outrunning seats — the constraint is on what the airport can handle, ` +
 				`not on how many people want to fly.`,
 			);
-		} else if (growth.percentile > 80 && strain.percentile < 30) {
+		} else if (
+			growth.percentile > PROFILE_THRESHOLDS.high &&
+			strain.percentile < PROFILE_THRESHOLDS.low
+		) {
 			interpretation.push(
 				`${code} is growing strongly without much congestion yet, which reads as headroom rather ` +
 				`than an immediate constraint.`,
 			);
-		} else if (strain.percentile > 70 && growth.percentile > 70) {
+		} else if (
+			strain.percentile > PROFILE_THRESHOLDS.bothElevated &&
+			growth.percentile > PROFILE_THRESHOLDS.bothElevated
+		) {
 			interpretation.push(
 				`${code} is both congested and growing — the strongest combination for an expansion case.`,
 			);
 		}
 	}
-	if (demand?.percentile != null && demand.percentile > 85) {
+	if (demand?.percentile != null && demand.percentile > PROFILE_THRESHOLDS.loadFactorNotable) {
 		interpretation.push(
-			`Load factor is in the top ${(100 - demand.percentile).toFixed(0)}% of its cohort, so aircraft ` +
+			`Load factor is in the top ${topSharePct(demand.percentile).toFixed(0)}% of its cohort, so aircraft ` +
 			`are close to full and carriers cannot add passengers without adding seats.`,
 		);
 	}
-	if (seasonality && seasonality.swingRatio > 3) {
+	if (seasonality && seasonality.swingRatio > SEASONALITY.notableSwingRatio) {
 		interpretation.push(
 			`Congestion is strongly seasonal: ${seasonality.worstNasDelay.toFixed(2)} minutes per arrival ` +
 			`in month ${seasonality.worstMonth} against ${seasonality.bestNasDelay.toFixed(2)} in month ` +
@@ -796,7 +971,7 @@ export function explainScore(iata: string): ToolResult<ExplainScoreResult> {
 			score: row.score,
 			components: row.components.map((c) => ({
 				component: c.key,
-				plainLabel: PLAIN_LABELS[c.key] ?? c.key,
+				plainLabel: COMPONENT_LABELS[c.key] ?? c.key,
 				rawValue: c.rawValue,
 				unit: c.unit,
 				percentileInCohort: c.percentile,
@@ -864,18 +1039,23 @@ export function flightMix(iata: string): ToolResult<FlightMixResult> {
 	const hauls = current.paxShort + current.paxMedium + current.paxLong;
 	const pct = (n: number) => (hauls > 0 ? (n / hauls) * 100 : 0);
 
-	const routes = loadRoutes(code, YEARS.current, 400);
+	const routes = loadRoutes(code, YEARS.current, FLIGHT_MIX.routeSampleSize);
 	const constrained = routes
-		.filter((r) => r.loadFactor !== null && r.loadFactor >= 88 && r.passengers >= 20_000)
+		.filter(
+			(r) =>
+				r.loadFactor !== null &&
+				r.loadFactor >= CONSTRAINED_ROUTE.minLoadFactorPct &&
+				r.passengers >= CONSTRAINED_ROUTE.minPassengers,
+		)
 		.sort((a, b) => b.loadFactor! - a.loadFactor!)
-		.slice(0, 8);
+		.slice(0, FLIGHT_MIX.constrainedRoutesShown);
 
 	// Cargo is worth flagging explicitly where it dwarfs the passenger business: a "share of
 	// long-haul flights" answer means something quite different at a freight hub.
 	let freightNote: string | null = null;
-	if (current.freightLbs > 1_000_000_000) {
+	if (current.freightLbs > FREIGHT_HUB_MIN_LBS) {
 		freightNote =
-			`${code} handled ${(current.freightLbs / 1e9).toFixed(2)} billion pounds of freight in ` +
+			`${code} handled ${(current.freightLbs / LBS_PER_BILLION).toFixed(2)} billion pounds of freight in ` +
 			`${YEARS.current} on dedicated cargo services, alongside ` +
 			`${Math.round(current.passengers).toLocaleString("en-US")} scheduled passengers. The figures ` +
 			`above cover passenger service only; the cargo operation is a separate and in this case larger business.`;
@@ -900,7 +1080,7 @@ export function flightMix(iata: string): ToolResult<FlightMixResult> {
 			internationalPct: current.intlShare ?? 0,
 			freightLbs: current.freightLbs,
 			freightNote,
-			topRoutes: routes.slice(0, 10).map((r) => ({
+			topRoutes: routes.slice(0, FLIGHT_MIX.topRoutesShown).map((r) => ({
 				dest: r.dest,
 				passengers: r.passengers,
 				loadFactorPct: r.loadFactor,
@@ -919,7 +1099,7 @@ export function flightMix(iata: string): ToolResult<FlightMixResult> {
 			metricDefinitions: [
 				`Haul bands by great-circle distance: short under ${HAUL_BANDS.shortMaxMiles} miles, medium ${HAUL_BANDS.shortMaxMiles}-${HAUL_BANDS.longMinMiles}, long at or above ${HAUL_BANDS.longMinMiles}.`,
 				"Shares are of passengers, not of flights — a long-haul flight carries more people than a short one, so the two differ.",
-				"A route is called constrained when its load factor is 88% or above with at least 20,000 annual passengers.",
+				`A route is called constrained when its load factor is ${CONSTRAINED_ROUTE.minLoadFactorPct}% or above with at least ${CONSTRAINED_ROUTE.minPassengers.toLocaleString("en-US")} annual passengers.`,
 			],
 			assumptions: [
 				...BASE_ASSUMPTIONS,
@@ -927,7 +1107,13 @@ export function flightMix(iata: string): ToolResult<FlightMixResult> {
 			],
 			// At a freight hub the cargo business is the bigger story, and a passenger-only percentage
 			// read without it is misleading. Required rather than offered — see ResultEnvelope.mustMention.
-			...(freightNote ? {mustMention: [freightNote]} : {}),
+			...(freightNote
+				? {
+					mustMention: [
+						{key: `freight:${code}`, priority: "critical" as const, text: freightNote},
+					],
+				}
+				: {}),
 			confidence: "high",
 		}),
 	);

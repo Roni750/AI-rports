@@ -1,3 +1,10 @@
+import {
+	checkRelayed,
+	relayRate,
+	resolveRequiredContext,
+	type MustMention,
+	type RequiredContextCheck,
+} from "../tools/must-mention";
 import {dispatchTool, TOOL_SCHEMAS} from "./tool-schemas";
 import {systemPrompt} from "./system-prompt";
 
@@ -26,6 +33,40 @@ export const DEFAULT_MODEL = process.env.GROQ_MODEL ?? "openai/gpt-oss-120b";
 
 /** Bounds the loop. Each iteration is one model call plus its tool executions. */
 const MAX_ITERATIONS = 6;
+
+/**
+ * How long one model call may take before it is abandoned.
+ *
+ * Node's `fetch` has no default timeout, so a connection that opens and never responds holds the
+ * request handler open indefinitely — no error, no log line, just a request that never finishes.
+ * Generous enough that a slow-but-working answer is never cut off.
+ */
+const REQUEST_TIMEOUT_MS = 60_000;
+
+/**
+ * Wait, but give up the moment the caller does.
+ *
+ * A bare `setTimeout` between rate-limit retries ignores the abort signal, so a client that had
+ * already disconnected still cost up to 30 seconds of a held request slot per retry — waiting to
+ * produce an answer nobody was going to receive.
+ */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) {
+			reject(signal.reason);
+			return;
+		}
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		function onAbort() {
+			clearTimeout(timer);
+			reject(signal!.reason);
+		}
+		signal?.addEventListener("abort", onAbort, {once: true});
+	});
+}
 
 /**
  * Groq's free tier limits tokens per minute (8,000 at the time of writing), not requests, so the
@@ -149,6 +190,16 @@ export interface AgentUsage {
 export interface AgentResult {
 	reply: string;
 	trace: ToolTraceEntry[];
+	/**
+	 * Facts the tools marked as required, and whether the answer actually carried each one.
+	 *
+	 * The point of checking rather than only asking: a dropped fact and a relayed one look
+	 * identical from the outside, so without this the guarantee is an assertion. With it, relay
+	 * compliance becomes a number that can be watched over time.
+	 */
+	requiredContext: RequiredContextCheck[];
+	/** Share of required facts relayed, or null when the turn required none. */
+	requiredContextRelayRate: number | null;
 	iterations: number;
 	model: string;
 	/** Set when the loop hit its iteration cap without the model producing a final answer. */
@@ -212,6 +263,9 @@ async function callModel(
 		});
 		if (stats && attempt === 0) stats.requestChars = payload.length;
 
+		// The caller's signal AND a timeout: the first aborts when the user goes away, the second
+		// when the provider stops answering. Either alone leaves one of the two hangs open.
+		const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
 		const res = await fetch(GROQ_URL, {
 			method: "POST",
 			headers: {
@@ -219,7 +273,7 @@ async function callModel(
 				Authorization: `Bearer ${apiKey}`,
 			},
 			body: payload,
-			signal,
+			signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
 		});
 
 		if (res.ok) {
@@ -249,8 +303,7 @@ async function callModel(
 			// recovers on its own is worth far more than one that shows an error.
 			if (attempt < MAX_RATE_LIMIT_RETRIES) {
 				if (stats) stats.rateLimitRetries++;
-				const wait = retryDelayMs(res.headers, attempt);
-				await new Promise((r) => setTimeout(r, wait));
+				await sleep(retryDelayMs(res.headers, attempt), signal);
 				continue;
 			}
 			const remaining = res.headers.get("x-ratelimit-remaining-tokens");
@@ -312,6 +365,9 @@ export async function runAgent(
 	];
 
 	const trace: ToolTraceEntry[] = [];
+	// Accumulated across every tool call in the turn, then deduplicated and ordered once at the
+	// end — a fact two tools both noticed should reach the reader once.
+	const collectedMustMention: MustMention[] = [];
 	let iterations = 0;
 
 	const startedAt = Date.now();
@@ -340,6 +396,13 @@ export async function runAgent(
 	});
 
 	const usage = (): AgentUsage => ({promptTokens, completionTokens, callsMissingUsage});
+
+	/** Resolves the required-context set against a finished answer. */
+	const withRequiredContext = (reply: string) => {
+		const required = resolveRequiredContext(collectedMustMention);
+		const requiredContext = checkRelayed(required, reply);
+		return {requiredContext, requiredContextRelayRate: relayRate(requiredContext)};
+	};
 
 	/** Wraps every model call so no timing path can be forgotten. */
 	const timedCall = async (
@@ -379,8 +442,10 @@ export async function runAgent(
 
 		const toolCalls = message.tool_calls ?? [];
 		if (toolCalls.length === 0) {
+			const reply = message.content?.trim() || "I could not produce an answer for that.";
 			return {
-				reply: message.content?.trim() || "I could not produce an answer for that.",
+				reply,
+				...withRequiredContext(reply),
 				trace,
 				iterations,
 				model,
@@ -405,6 +470,8 @@ export async function runAgent(
 			const result = error
 				? {ok: false as const, code: "invalid_parameters" as const, message: error}
 				: dispatchTool(call.function.name, args);
+
+			if (result.ok && result.mustMention) collectedMustMention.push(...result.mustMention);
 
 			trace.push({
 				name: call.function.name,
@@ -437,10 +504,13 @@ export async function runAgent(
 		false,
 	);
 
+	const closingReply =
+		closing.content?.trim() ||
+		"I gathered data but could not complete an answer within the step limit.";
+
 	return {
-		reply:
-			closing.content?.trim() ||
-			"I gathered data but could not complete an answer within the step limit.",
+		reply: closingReply,
+		...withRequiredContext(closingReply),
 		trace,
 		iterations,
 		model,

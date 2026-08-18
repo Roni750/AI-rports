@@ -17,6 +17,8 @@
  * a structured failure with suggestions lets it ask a better question.
  */
 
+import type { MustMention } from "./must-mention";
+
 export type Confidence = "high" | "medium" | "low";
 
 export interface ResultEnvelope {
@@ -39,8 +41,13 @@ export interface ResultEnvelope {
    *
    * Anything placed here is something the answer is wrong without. The system prompt treats it as
    * mandatory rather than as a suggestion. Structure beats persuasion.
+   *
+   * Each entry carries a `key` so the same fact spotted by two tools is relayed once, and a
+   * `priority` so a cross-cohort warning outranks a metro relationship when several accumulate.
+   * The agent checks after the fact whether each one actually reached the answer — see
+   * `must-mention.ts`, because asking without checking is still only persuasion.
    */
-  mustMention?: string[];
+  mustMention?: MustMention[];
 }
 
 export interface ToolSuccess<T> extends ResultEnvelope {
