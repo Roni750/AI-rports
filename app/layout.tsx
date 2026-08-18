@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
@@ -16,6 +16,18 @@ export const metadata: Metadata = {
   title: "Airport Investment Intelligence",
   description:
     "Screen US airports for expansion opportunity using BTS traffic and delay data.",
+};
+
+/**
+ * Paints mobile browser chrome to match the page, so the address bar does not sit as a light band
+ * above a dark app. Two entries rather than one: the theme follows the OS setting, so a single
+ * colour would be wrong half the time. Values match `--background` in globals.css.
+ */
+export const viewport: Viewport = {
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#0a0a0a" },
+  ],
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

@@ -115,7 +115,10 @@ export default function Page() {
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    // `scrollIntoView` takes its behaviour from this argument, not from the stylesheet, so the
+    // reduced-motion rule in globals.css cannot reach it. Asked directly instead.
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    endRef.current?.scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "end" });
   }, [turns, busy]);
 
   async function send(text: string) {
@@ -176,7 +179,7 @@ export default function Page() {
           <h1 className="text-lg font-semibold">Airport Investment Intelligence</h1>
           <Link
             href="/analytics"
-            className="text-sm underline decoration-dotted opacity-70 hover:opacity-100"
+            className="rounded text-sm underline decoration-dotted opacity-70 hover:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current/50"
           >
             Analytics →
           </Link>
@@ -196,7 +199,7 @@ export default function Page() {
               type="button"
               onClick={() => send(q)}
               disabled={busy}
-              className="rounded-lg border border-current/15 px-3 py-2 text-left text-sm transition hover:border-current/40 hover:bg-current/5 disabled:opacity-50"
+              className="rounded-lg border border-current/15 px-3 py-2 text-left text-sm transition hover:border-current/40 hover:bg-current/5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current/50 disabled:opacity-50"
             >
               {q}
             </button>
@@ -207,7 +210,12 @@ export default function Page() {
       <div className="flex flex-1 flex-col gap-4">
         {turns.map((turn, i) =>
           turn.role === "user" ? (
-            <div key={i} className="self-end rounded-2xl bg-current/10 px-4 py-2 text-sm">
+            <div
+              key={i}
+              // A pasted airport list or a long unspaced string would otherwise widen the bubble
+              // past the column and put a horizontal scrollbar on the whole page.
+              className="max-w-full self-end overflow-hidden rounded-2xl bg-current/10 px-4 py-2 text-sm break-words"
+            >
               {turn.content}
             </div>
           ) : (
@@ -238,7 +246,7 @@ export default function Page() {
                   <button
                     type="button"
                     onClick={() => setOpenTrace(openTrace === i ? null : i)}
-                    className="opacity-60 underline decoration-dotted hover:opacity-100"
+                    className="rounded underline decoration-dotted opacity-60 hover:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current/50"
                   >
                     {openTrace === i ? "Hide" : "Show"} data sources ({turn.trace.length}{" "}
                     {turn.trace.length === 1 ? "tool call" : "tool calls"})
@@ -253,12 +261,16 @@ export default function Page() {
                               {t.ok ? "ok" : t.errorCode ?? "error"}
                             </span>
                             <span className="font-semibold">{t.name}</span>
-                            <span className="opacity-60">
+                            {/* Serialised arguments have no spaces to wrap at, so they need
+                                break-all and a min-w-0 flex parent or they push the row wide. */}
+                            <span className="min-w-0 break-all opacity-60">
                               {Object.keys(t.arguments).length > 0
                                 ? JSON.stringify(t.arguments)
                                 : "{}"}
                             </span>
-                            <span className="opacity-40">{t.durationMs}ms</span>
+                            <span className="tabular-nums whitespace-nowrap opacity-40">
+                              {t.durationMs}&nbsp;ms
+                            </span>
                           </div>
 
                           {/*
@@ -341,12 +353,12 @@ export default function Page() {
           placeholder="Ask about an airport, a region, or a comparison…"
           disabled={busy}
           autoComplete="off"
-          className="flex-1 rounded-lg border border-current/20 bg-transparent px-3 py-2 text-sm outline-none focus:border-current/50 disabled:opacity-50"
+          className="min-w-0 flex-1 rounded-lg border border-current/20 bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-current/50 focus-visible:ring-2 focus-visible:ring-current/25 disabled:opacity-50"
         />
         <button
           type="submit"
           disabled={busy || input.trim() === ""}
-          className="rounded-lg border border-current/20 px-4 py-2 text-sm font-medium transition hover:bg-current/10 disabled:opacity-40"
+          className="rounded-lg border border-current/20 px-4 py-2 text-sm font-medium transition hover:bg-current/10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current/50 disabled:opacity-40"
         >
           Ask
         </button>

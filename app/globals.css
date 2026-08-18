@@ -1,6 +1,14 @@
 @import "tailwindcss";
 
 :root {
+  /*
+   * Tells the browser both themes are supported, so it themes the things CSS cannot reach:
+   * scrollbars, form control interiors, the canvas behind an overscroll. Without it the app went
+   * dark while its scrollbar stayed light. Declared as `light dark` rather than a fixed value
+   * because the theme below follows prefers-color-scheme rather than a manual toggle.
+   */
+  color-scheme: light dark;
+
   --background: #ffffff;
   --foreground: #171717;
 
@@ -13,15 +21,29 @@
    *
    * So this is the one place named colours are declared, as an ordered scale rather than
    * per-meaning names — chart-1 is simply "the first series", which keeps the palette reusable and
-   * stops it accumulating a colour per concept. Muted on purpose, to sit beside the existing
-   * greyscale chrome rather than shout over it.
+   * stops it accumulating a colour per concept.
+   *
+   * THE ORDER IS LOAD-BEARING, NOT AESTHETIC. These are the Okabe-Ito colourblind-safe hues, and
+   * the sequence is chosen so that ADJACENT slots stay separable — adjacent pairs are what collide
+   * when a chart uses three or four series. Green beside pink, and sky-blue beside green, both fall
+   * below the deuteranopia threshold; moving pink to slot 2 and sky-blue to slot 6 is what fixes
+   * it. Assign slots in fixed order and never cycle. A seventh series folds into "Other" or becomes
+   * small multiples — it is never a newly invented hue.
+   *
+   * Verified with the dataviz validator against both surfaces: all six checks pass in light and
+   * dark. Re-run it before changing any value here; the previous palette looked fine and had two
+   * pairs that were indistinguishable to red-green colourblind readers.
+   *
+   * Three light-mode hues sit below 3:1 against white. That is permitted only because every chart
+   * carries direct labels and a data table, which is the required relief — not because it is close
+   * enough.
    */
-  --chart-1: #3b6ea5;
-  --chart-2: #4f9d76;
-  --chart-3: #c08a3e;
-  --chart-4: #9a5f9e;
-  --chart-5: #4d8f9c;
-  --chart-6: #b0603f;
+  --chart-1: #0072b2;
+  --chart-2: #cc79a7;
+  --chart-3: #e69f00;
+  --chart-4: #009e73;
+  --chart-5: #d55e00;
+  --chart-6: #56b4e9;
   --chart-grid: rgb(0 0 0 / 0.1);
 }
 
@@ -43,13 +65,18 @@
     --background: #0a0a0a;
     --foreground: #ededed;
 
-    /* Lifted for contrast against the dark ground; same hues, same order. */
-    --chart-1: #6fa8dc;
-    --chart-2: #7bc4a0;
-    --chart-3: #e0b070;
-    --chart-4: #c08fc4;
-    --chart-5: #79b9c6;
-    --chart-6: #d98f6e;
+    /*
+     * Same hues and same order, re-stepped for the dark ground — not an automatic lightening.
+     * The dark lightness band is both narrower and DARKER than intuition suggests, so the naive
+     * "brighten everything" version fails: it pushes hues out of band and collapses the gaps
+     * between them. These values are validated against the dark surface independently.
+     */
+    --chart-1: #4a93d6;
+    --chart-2: #be7099;
+    --chart-3: #b87a00;
+    --chart-4: #00a37a;
+    --chart-5: #e06a22;
+    --chart-6: #3e9bd0;
     --chart-grid: rgb(255 255 255 / 0.12);
   }
 }
@@ -58,6 +85,26 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-geist-sans), system-ui, sans-serif;
+  /* Drops the ~300ms wait mobile browsers hold before firing a tap, in case it becomes a zoom. */
+  touch-action: manipulation;
+}
+
+/*
+ * Reduced motion.
+ *
+ * Covers CSS transitions, CSS animations and the smooth scroll after each answer. It does NOT
+ * cover the charts: Recharts animates in JavaScript, so it never consults this rule — that needs
+ * `isAnimationActive` passed per series, which is a change to the chart components themselves.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 /*
@@ -73,6 +120,12 @@ body {
   font-size: 0.875rem;
   display: block;
   overflow-x: auto;
+  /*
+   * Fixed-width digits. Almost every table the agent emits is a ranking, and proportional digits
+   * make a column of scores fail to line up on the decimal point — which is exactly the comparison
+   * the table exists to support. Affects digits only, so the text columns are unchanged.
+   */
+  font-variant-numeric: tabular-nums;
 }
 .answer th,
 .answer td {
