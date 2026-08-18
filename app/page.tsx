@@ -1,11 +1,26 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { costUsd, formatUsd } from "../lib/analytics/pricing";
+import type { ChartPayload } from "../lib/tools/chart-payload";
+
+/**
+ * Charts load on demand.
+ *
+ * Recharts and its d3 dependencies are heavy, and this is the landing page — most first visits
+ * never reach a tool call, let alone one with a visual treatment. Keeping the chart leaf out of the
+ * initial bundle costs one render frame the first time a chart appears and saves every visitor who
+ * never sees one.
+ */
+const ChartForPayload = dynamic(
+  () => import("./chat-charts").then((m) => m.ChartForPayload),
+  { ssr: false, loading: () => <div className="my-3 h-24" aria-hidden /> },
+);
 
 /**
  * Chat interface for the airport investment agent.
@@ -21,6 +36,8 @@ interface ToolTraceEntry {
   ok: boolean;
   errorCode?: string;
   durationMs: number;
+  /** The tool's own result. Present when the tool has a visual treatment and the call succeeded. */
+  payload?: ChartPayload;
 }
 
 interface Turn {
@@ -40,16 +57,24 @@ interface Turn {
  * conversation. A cookie would work too, and would also make this a stateful endpoint and raise a
  * consent question that a screening demo has no need to answer.
  *
- * Minted lazily inside the send handler rather than in a `useState` initialiser: the initialiser
- * runs during server rendering, where `sessionStorage` and `crypto.randomUUID` are unavailable and
- * a generated value would differ between server and client, producing a hydration mismatch.
+ * MINTED BY THE SERVER, not here. The id ends up in `turn_id` and the turn write is an upsert, so
+ * a client that could choose its own id could name — and therefore overwrite — another
+ * conversation's recorded turn. The server now returns a signed token on every response and
+ * ignores anything it did not sign; this side just holds on to whatever it was given. The first
+ * request of a session sends nothing and is answered with a fresh token.
+ *
+ * Read inside the send handler rather than in a `useState` initialiser: the initialiser runs
+ * during server rendering, where `sessionStorage` is unavailable, and a value that differed
+ * between server and client would produce a hydration mismatch.
  */
-function sessionId(): string {
-  const existing = sessionStorage.getItem("aii.session");
-  if (existing) return existing;
-  const fresh = crypto.randomUUID();
-  sessionStorage.setItem("aii.session", fresh);
-  return fresh;
+const SESSION_KEY = "aii.session";
+
+function storedSessionToken(): string | undefined {
+  return sessionStorage.getItem(SESSION_KEY) ?? undefined;
+}
+
+function rememberSessionToken(token: unknown): void {
+  if (typeof token === "string" && token !== "") sessionStorage.setItem(SESSION_KEY, token);
 }
 
 /**
@@ -109,10 +134,13 @@ export default function Page() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           messages: nextTurns.map((t) => ({ role: t.role, content: t.content })),
-          sessionId: sessionId(),
+          sessionId: storedSessionToken(),
         }),
       });
       const data = await res.json();
+      // Stored before the status check: the error paths return a token too, so a session survives
+      // a failed turn instead of splitting the conversation in the analytics table.
+      rememberSessionToken(data.sessionId);
 
       if (!res.ok) {
         setError({ message: data.error ?? `Request failed (${res.status})`, hint: data.hint });
@@ -184,6 +212,17 @@ export default function Page() {
             </div>
           ) : (
             <div key={i} className="flex flex-col gap-2">
+              {/*
+                Drawn from the tool payloads, above the narration they belong to. Nothing here was
+                produced by the model: it chose the tool, the tool returned typed data, and the
+                component renders that data. The prose below stays complete on its own.
+              */}
+              {turn.trace?.map((t, j) =>
+                t.payload ? (
+                  <ChartForPayload key={j} payload={t.payload} onAsk={send} disabled={busy} />
+                ) : null,
+              )}
+
               <div className="answer text-sm leading-relaxed">
                 <Markdown remarkPlugins={[remarkGfm]}>{turn.content}</Markdown>
               </div>
@@ -208,17 +247,35 @@ export default function Page() {
                   {openTrace === i && (
                     <ul className="mt-2 flex flex-col gap-1 rounded-lg border border-current/10 p-2 font-mono">
                       {turn.trace.map((t, j) => (
-                        <li key={j} className="flex flex-wrap items-baseline gap-2">
-                          <span className={t.ok ? "text-emerald-600 dark:text-emerald-500" : "text-red-600 dark:text-red-500"}>
-                            {t.ok ? "ok" : t.errorCode ?? "error"}
-                          </span>
-                          <span className="font-semibold">{t.name}</span>
-                          <span className="opacity-60">
-                            {Object.keys(t.arguments).length > 0
-                              ? JSON.stringify(t.arguments)
-                              : "{}"}
-                          </span>
-                          <span className="opacity-40">{t.durationMs}ms</span>
+                        <li key={j} className="flex flex-col gap-1">
+                          <div className="flex flex-wrap items-baseline gap-2">
+                            <span className={t.ok ? "text-emerald-600 dark:text-emerald-500" : "text-red-600 dark:text-red-500"}>
+                              {t.ok ? "ok" : t.errorCode ?? "error"}
+                            </span>
+                            <span className="font-semibold">{t.name}</span>
+                            <span className="opacity-60">
+                              {Object.keys(t.arguments).length > 0
+                                ? JSON.stringify(t.arguments)
+                                : "{}"}
+                            </span>
+                            <span className="opacity-40">{t.durationMs}ms</span>
+                          </div>
+
+                          {/*
+                            The raw payload the charts will be drawn from. Visible here on purpose:
+                            it is the same object the components receive, so "does the chart match
+                            the answer" is checkable rather than a matter of trust.
+                          */}
+                          {t.payload && (
+                            <details className="ml-4">
+                              <summary className="cursor-pointer opacity-50 hover:opacity-100">
+                                payload
+                              </summary>
+                              <pre className="mt-1 max-h-64 overflow-auto rounded border border-current/10 p-2 text-[10px] leading-relaxed opacity-70">
+                                {JSON.stringify(t.payload.data, null, 2)}
+                              </pre>
+                            </details>
+                          )}
                         </li>
                       ))}
                       {turn.model && (
