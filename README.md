@@ -93,7 +93,8 @@ behind it. Each exercises a different capability:
 > **Leave about a minute between questions.** The free Groq tier caps tokens per minute.
 
 There is also a dashboard at **http://localhost:3000/analytics** — cost, latency, token use, tool
-calls and topic mix across conversations.
+calls, and two dimensions of what was asked: the topic mix (what *kind* of question) and the
+airports named (what it was *about*), including what people type when they do not type a code.
 
 ---
 
@@ -102,7 +103,7 @@ calls and topic mix across conversations.
 | Document | What's in it |
 |---|---|
 | **[DESIGN.md](DESIGN.md)** | Scoring methodology, key tradeoffs, where AI is used — **start here** |
-| [docs/architecture-diagrams.md](docs/architecture-diagrams.md) | System overview, data pipeline, scoring flow, agent loop, ambiguity handling |
+| [docs/architecture-diagrams.md](docs/architecture-diagrams.md) | Eight diagrams: system overview, data pipeline, scoring flow, agent loop, required context, ambiguity handling, analytics, and where the boundary sits |
 | [docs/scoring-methodology.md](docs/scoring-methodology.md) | The model from first principles, no jargon assumed |
 | [docs/data-architecture.md](docs/data-architecture.md) | Ingestion, entity modelling, how missing sources would be added |
 
@@ -138,6 +139,8 @@ npm run verify             # typecheck + tests
 npm run data:smoke         # scoring engine against the real dataset
 npm run data:verify-tools  # the four questions above, through the tool layer, no model calls
 npm run models             # list the models your API key can actually use
+npm run eval:topics        # topic classifier precision/recall/F1, no network needed
+npm run analytics:entities # re-extract airport entities over every recorded turn
 ```
 
 `data:verify-tools` is the quickest way to watch the deterministic core work without spending any
@@ -172,7 +175,7 @@ lib/scoring/      deterministic scoring engine — percentiles, cohorts, robustn
 lib/tools/        six typed tools; assumptions travel as data, not prose
 lib/agent/        bounded tool-calling loop, tool schemas, system prompt
 lib/data/         read-only SQLite access (the only file that knows the storage format)
-lib/analytics/    conversation recording, topic classification, cost accounting
+lib/analytics/    conversation recording, topic classification, entity extraction, cost accounting
 app/api/chat/     chat endpoint (Node runtime — node:sqlite is unavailable on Edge)
 app/page.tsx      chat UI with the tool trace panel
 app/analytics/    the analytics dashboard

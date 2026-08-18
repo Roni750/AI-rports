@@ -201,10 +201,86 @@ Moving the content into a required field did, first try.
 can lose. It now carries the freight note, metro-catchment relationships, and every ranking's
 robustness note.
 
+**Attach the fact to the airport, not to the tool.** The first version emitted the metro
+relationship only from `compareAirports`. The model then answered "compare LA and Santa Ana" with
+`resolveAirport` and two `getAirportMetrics` calls, never touched `compareAirports`, and compared
+the two airports without ever mentioning they share a catchment area. The requirement was correct
+and simply never fired. Every tool that returns an airport now emits it, and a stable `key` means
+the same fact spotted by two tools is still stated once.
+
+**Asking without checking is still only persuasion.** After the model replies, `checkRelayed`
+looks for each item's distinctive signals — figures, airport codes — in the finished text, and a
+relay rate is returned with the answer and shown in the trace panel. That converts a hope about
+prompt-following into a number, which is the difference between believing the mechanism works and
+knowing when it stops. It is the honest limitation of the approach, too: the check confirms the
+context was *stated*, not that it was stated *well*.
+
 ### The tool trace is a feature, not debug output
 
 The UI shows every tool call behind each answer. It is the visible proof of the architecture: a
-reader can confirm the figures came from named functions rather than from the model.
+reader can confirm the figures came from named functions rather than from the model. Each call can
+be expanded to the exact payload the charts were drawn from, so "does the picture match the prose"
+is checkable rather than a matter of trust.
+
+### Generative UI — the model composes, it does not draw
+
+Answers carry charts: a score is shown as the four weighted contributions that sum to it, a ranking
+as sorted bars, a traffic mix as two part-to-whole bars. There are two ways to build this and only
+one of them survives the rule above.
+
+The common approach is to let the model emit a chart spec, or JSX. That would hand it the decision
+of what goes into the chart, which is the same thing as letting it invent a number — precisely what
+the tool boundary exists to prevent.
+
+So the model never sees a chart. It chooses a **tool**; the tool returns its typed result; the
+client maps the tool name to a component, and that component renders the result verbatim. The
+composition of an answer is generated per turn — which figures appear, and in what order, is
+decided by the model's tool choices — while every value in them originates below the tool boundary.
+**Same boundary as the scoring engine, one layer up.**
+
+Mechanically this is `lib/tools/chart-payload.ts`: a union discriminated by tool name, so a tool
+added without deciding how it should look is a compile error rather than a silently empty turn. The
+payload sent to the browser is the *full* tool result, not the compacted one sent to the model —
+compaction rounds figures and drops nulls, which is right for a prompt and wrong for a chart.
+
+Three consequences worth stating:
+
+- **Charts are additive, never substitutive.** `mustMention` checks that required context reached
+  the answer *text*. A picture cannot discharge that obligation, so the prose stays complete alone.
+- **Every chart carries its data table.** Partly accessibility, partly the same argument as the tool
+  trace: a figure you can read the numbers behind is a figure you can check.
+- **Two tools deliberately get no chart.** `getAirportMetrics` covers three years, and a line across
+  three points draws a trend the data cannot support — it gets tiles stating level and change
+  instead. `resolveAirport` gets choice cards rather than a visualisation, which turns the ambiguity
+  handling from a paragraph the user must answer in prose into an actual choice.
+
+The chart palette is the Okabe-Ito colourblind-safe set, and its **order is load-bearing rather than
+aesthetic**: adjacent slots are what collide when a chart uses three or four series, and green
+beside pink falls below the deuteranopia threshold. The previous palette looked fine and contained
+two pairs indistinguishable to red-green colourblind readers, one of which was also below the
+threshold for full colour vision. Both are validated against both surfaces; see the note in
+`globals.css` before changing any value there.
+
+### Accessibility, reviewed rather than assumed
+
+The UI was checked against the Vercel Web Interface Guidelines rather than by eye. Four things that
+review caught, none of which were visible while developing on one machine:
+
+- **The dark theme never told the browser it was dark.** The theme is a `prefers-color-scheme`
+  media query, but without `color-scheme` the browser keeps painting the parts CSS cannot reach —
+  the app went dark while its scrollbar stayed light.
+- **Nothing handled `prefers-reduced-motion`.** The CSS covers transitions and animations; the
+  scroll after each answer takes its behaviour from a JavaScript argument rather than the
+  stylesheet, so it asks `matchMedia` directly. Still outstanding: Recharts animates in JS and
+  needs `isAnimationActive` threaded per series.
+- **Keyboard focus was nearly invisible on the composer** — `outline-none` with only a
+  border-colour swap, and on `:focus` rather than `:focus-visible`, so a mouse click drew a ring it
+  did not need while a keyboard user got almost nothing.
+- **Long content broke the layout.** An unspaced user message widened its bubble past the column
+  and put a horizontal scrollbar on the page; serialised tool arguments did the same to a trace row.
+
+The pattern is worth more than the individual fixes: each was a default that looked fine until
+someone used the product differently from the way it was built.
 
 ---
 
@@ -269,6 +345,20 @@ argument: if a lookup table and a regex settle it, spending a model call is a ch
 nothing. The split also keeps classification off the request path, where it would compete with the
 answer a user is waiting for against a per-minute token budget.
 
+**A second dimension: what the questions were about.** Topics classify the *kind* of question;
+they cannot say that LAX was asked about nine times. Airports are an orthogonal axis, extracted
+deterministically from the prompt and the tool arguments against a lookup built from the shipped
+dataset — 728 codes and 1,380 city spellings, no model involved, because recognising "ANC" is
+membership in a closed set rather than a judgement. Crucially it reads **arguments, never results**:
+an airport in row 9 of a ranking was returned, not asked about, and counting it would silently turn
+"how often was LAX asked about" into "how often did LAX rank highly".
+
+Because tool arguments were already being stored, the dimension backfilled over the entire recorded
+history with no agent calls and no tokens spent. It immediately surfaced something the topic view
+cannot: SJU and BGR appear with zero user mentions and two agent resolutions, because the questions
+were anaphoric — *"compare the top two"*, *"why does the top one rank there?"*. It also records what
+people type when they do not type a code, which in this corpus is exactly one thing: "la".
+
 **How I know it works.** A 63-item labelled gold set, with per-class precision/recall/F1, a confusion
 matrix, and both accuracy denominators — abstentions counted as wrong, and abstentions excluded.
 Publishing only the second is how a classifier with a coverage problem looks excellent. `npm run
@@ -291,6 +381,22 @@ seeded traffic is labelled wherever it appears with a one-click filter to exclud
 **Analytics is a passenger.** The write happens in Next's `after()`, after the response is flushed,
 so it costs the user nothing; `recordTurn` cannot throw; and if the store is unreachable the
 dashboard says so rather than rendering an empty chart that looks like an absence of traffic.
+
+**The session id is signed, and the reason is not obvious.** `turn_id` is derived from the session
+id and the turn write is an upsert — so accepting any well-formed UUID from the browser let a
+caller name, and therefore silently overwrite, another conversation's recorded turn. The server now
+mints a signed token and ignores anything it did not sign.
+
+The interesting part is what happens on a bad token. It **degrades rather than rejects**: an
+unrecognised token earns a fresh session instead of failing the request. Refusing to answer a
+question because its telemetry label was malformed would invert the priority between the product
+and the measurement of it — the same principle as `recordTurn` being unable to throw, applied at
+the door instead of the write.
+
+Recorded prompts are user content, so the dashboard is gated: a production build with
+`ANALYTICS_TOKEN` unset serves the gate rather than the dashboard, which means a forgotten
+environment variable cannot publish them. Under `next dev` it stays open, so local work needs no
+ceremony.
 
 ---
 

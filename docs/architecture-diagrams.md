@@ -15,6 +15,7 @@ flowchart TB
     subgraph browser["Browser"]
         UI["Chat UI<br/><i>app/page.tsx</i>"]
         TRACE["Tool trace panel<br/><i>shows every call</i>"]
+        CHARTS["Generative UI<br/><i>app/chat-charts.tsx</i><br/>tool name picks the component"]
     end
 
     subgraph server["Next.js server — Node runtime"]
@@ -37,11 +38,14 @@ flowchart TB
         end
 
         DB[("SQLite<br/>5.8 MB<br/><i>committed</i>")]
+
+        REC["Analytics recorder<br/><i>Next.js after hook</i><br/>runs once the reply is sent"]
+        ADB[("analytics.db<br/><i>SQLite or Turso</i>")]
     end
 
     LLM["Groq<br/><i>openai/gpt-oss-120b</i><br/><b>routes and narrates only</b>"]
 
-    UI -->|"messages[]"| API
+    UI -->|"messages[] + signed session token"| API
     API --> AGENT
     AGENT <-->|"tool calls"| LLM
     AGENT --> DISPATCH
@@ -49,17 +53,34 @@ flowchart TB
     tools --> core
     core --> DB
     tools --> DB
-    AGENT -->|"reply + trace"| UI
+    AGENT -->|"reply + trace + tool payloads"| UI
     UI --> TRACE
+    UI --> CHARTS
+
+    API -.->|"off the critical path"| REC
+    REC --> ADB
+    ADB --> DASH["Dashboard<br/><i>/analytics</i>"]
 
     style LLM fill:#fff3cd,stroke:#856404,color:#000
     style core fill:#d4edda,stroke:#155724,color:#000
     style DB fill:#d1ecf1,stroke:#0c5460,color:#000
+    style ADB fill:#d1ecf1,stroke:#0c5460,color:#000
+    style CHARTS fill:#d4edda,stroke:#155724,color:#000
+    style REC fill:#e2e3e5,stroke:#383d41,color:#000
 ```
 
 **Reading the colours:** green is deterministic and unit-tested; amber is the only
 non-deterministic component; blue is data at rest. Notice that no arrow runs from the amber box
 into the green one — the model cannot reach the calculation.
+
+The same holds for the charts. The model selects a tool; the tool's typed result travels to the
+browser; the tool's NAME selects a component, which renders that result verbatim. Which figures
+appear in an answer is generated per turn — what they say is not. No arrow runs from the amber box
+to the charts either.
+
+**The recorder hangs off a dashed arrow on purpose.** It runs after the reply has already been
+sent, so measurement cannot slow down or fail an answer — the worst case for a broken analytics
+write is a missing row, never a failed question. Diagram 7 covers what it records.
 
 ---
 
@@ -172,6 +193,7 @@ sequenceDiagram
     participant M as Model (Groq)
     participant T as Tool dispatcher
     participant D as SQLite
+    participant R as Analytics recorder
 
     U->>A: "Compare LA and Santa Ana congestion"
     A->>M: system prompt + 6 tool schemas + history
@@ -194,14 +216,70 @@ sequenceDiagram
         M-->>A: text answer
     end
 
-    A-->>U: reply + tool trace
+    A->>A: check the reply relayed every mustMention
+    Note over A: measured, not assumed —<br/>a relay rate ships with the response
+
+    A-->>U: reply + tool trace + relay rate
+
+    A->>R: record the turn (after the reply is sent)
+    Note over R: never blocks the answer
 
     Note over U,D: Every figure in the reply came from a tool result.<br/>The trace panel makes that auditable.
 ```
 
 ---
 
-## 5. Ambiguity handling
+## 5. Required context — asking, then checking
+
+The brief asks the agent to communicate assumption, uncertainty and scoping. A prompt that *asks*
+for caveats gets them filtered: told that caveats were "worth including where they matter", the
+model dropped Anchorage's freight note — 5.75 billion pounds of cargo against 2.66 million
+passengers, which is the single most important thing about reading that airport's passenger
+figures.
+
+So context that an answer is wrong without travels as a **field on the tool result**, and the reply
+is checked against it afterwards.
+
+```mermaid
+flowchart TB
+    subgraph tools["Tools return mustMention as data"]
+        M1["getAirportMetrics<br/><i>key: freight:ANC</i>"]
+        M2["compareAirports<br/><i>key: metro:los_angeles</i>"]
+        M3["rankAirports<br/><i>key: cohort:mixed</i>"]
+    end
+
+    DEDUP["Resolve<br/><i>dedup by key, sort by priority</i>"]
+    PROMPT["Injected as REQUIRED context<br/><i>not as a suggestion</i>"]
+    REPLY["Model writes the answer"]
+    CHECK{"Did the reply actually<br/>relay each one?"}
+    RATE["relayRate ships on the response<br/><i>and the trace panel</i>"]
+
+    M1 --> DEDUP
+    M2 --> DEDUP
+    M3 --> DEDUP
+    DEDUP --> PROMPT --> REPLY --> CHECK --> RATE
+
+    style tools fill:#d4edda,stroke:#155724,color:#000
+    style REPLY fill:#fff3cd,stroke:#856404,color:#000
+    style CHECK fill:#d1ecf1,stroke:#0c5460,color:#000
+```
+
+**Two decisions worth defending.**
+
+*The fact is attached to the airport, not to one tool.* The first version emitted the metro
+relationship only from `compareAirports` — then the model answered "compare LA and Santa Ana" with
+`resolveAirport` plus two `getAirportMetrics` calls, never touched `compareAirports`, and compared
+the two airports without ever saying they share a catchment area. Every tool that returns an
+airport now emits it, and the `key` collapses the duplicates.
+
+*Asking without checking is still only persuasion.* `checkRelayed` looks for each item's distinctive
+signals — figures, airport codes — in the finished reply, and the relay rate is returned with the
+answer. That turns a hope about prompt-following into a number that would show up in the analytics
+if it regressed.
+
+---
+
+## 6. Ambiguity handling
 
 The brief's "compare LA and Santa Ana" question is deliberately ambiguous twice over: *LA* could
 mean one airport or five, **and Santa Ana is itself inside greater Los Angeles.** The system
@@ -240,7 +318,62 @@ field with 1,416 passengers is not care, it is obtuseness.
 
 ---
 
-## 6. Where the boundary sits
+## 7. Conversation analytics
+
+Recording what was asked, what it cost, how long it took, and what it was *about*. All of it runs
+after the reply has been sent, so the measurement can never delay or fail the thing it measures.
+
+```mermaid
+flowchart TB
+    TURN["A completed turn<br/><i>prompt, reply, trace, usage, timing</i>"]
+
+    subgraph extract["Two dimensions of what was asked"]
+        direction LR
+
+        subgraph det["Entities — deterministic"]
+            E1["Match IATA codes and city names<br/><i>against the airport table</i>"]
+            E2["ANC · SFO · 'Anchorage'"]
+        end
+
+        subgraph llm["Topic — genuinely fuzzy"]
+            C1{"Rules match?"}
+            C2["Keyword rules<br/><i>free, instant</i>"]
+            C3["Small model fallback<br/><i>openai/gpt-oss-20b</i>"]
+        end
+    end
+
+    ADB[("analytics.db<br/><i>SQLite locally,<br/>Turso deployed</i>")]
+    DASH["/analytics dashboard<br/><i>cost · latency · tokens ·<br/>topics · airports · reliability</i>"]
+
+    TURN --> E1 --> E2 --> ADB
+    TURN --> C1
+    C1 -->|yes| C2 --> ADB
+    C1 -->|no| C3 --> ADB
+    ADB --> DASH
+
+    style det fill:#d4edda,stroke:#155724,color:#000
+    style llm fill:#fff3cd,stroke:#856404,color:#000
+    style ADB fill:#d1ecf1,stroke:#0c5460,color:#000
+```
+
+**The same green/amber boundary as everywhere else in this system.** Recognising that "Anchorage"
+and "ANC" mean the same airport is a lookup against a table the app already has — there is no
+reason for a language model to decide whether ANC is an airport, and a deterministic answer is free,
+instant and cannot drift. Topic is the genuinely ambiguous part, so it gets rules first and a small
+model only when the rules abstain. The classifier is deliberately *not* the model that answers
+questions: it is cheaper, and it keeps six months of topic history from shifting when the chat model
+is swapped.
+
+**Why the session id is signed.** `turn_id` is derived from it and the write is an upsert, so
+accepting any well-formed id from the browser would let a caller name — and therefore overwrite —
+another conversation's recorded turn. The server mints a signed token and ignores anything it did
+not sign. Validation degrades rather than rejects: an unrecognised token earns a fresh session
+instead of failing the request, because refusing to answer a question over a bad telemetry label
+would invert the priority between the product and the measurement of it.
+
+---
+
+## 8. Where the boundary sits
 
 What the system measures, and what it deliberately does not.
 
