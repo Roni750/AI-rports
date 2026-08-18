@@ -5,7 +5,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ACTIVE_CLASSIFIER_VERSION } from "./classifier-version";
 import { recordTurn } from "./record";
 import {
+  airportDistribution,
   classifierHealth,
+  coverageGaps,
+  unresolvedPhrasings,
   needsReview,
   overview,
   percentile,
@@ -302,5 +305,124 @@ describe("recentSessions", () => {
     const result = await topicDistribution();
     expect(TAXONOMY_VERSION).toBe(1);
     expect(result.data.some((t) => t.turns > 0)).toBe(true);
+  });
+});
+
+describe("airportDistribution", () => {
+  it("counts distinct turns, not rows, when an airport comes from both sources", async () => {
+    // The airport is named in the prompt AND passed to a tool, which stores two rows on purpose.
+    // Counting rows would rank airports by how thoroughly they were processed rather than by how
+    // often they were asked about, and would put this one at 2 against a genuine 1.
+    await recordTurn(
+      turn({
+        sessionId: "a",
+        turnIndex: 0,
+        prompt: "how is Anchorage doing?",
+        toolTrace: [{ name: "flightMix", arguments: { iata: "ANC" }, ok: true, durationMs: 4 }],
+      }),
+    );
+
+    const result = await airportDistribution();
+    const anc = result.data.find((row) => row.code === "ANC")!;
+    expect(anc.turns).toBe(1);
+    expect(anc.promptTurns).toBe(1);
+    expect(anc.toolTurns).toBe(1);
+    expect(anc.label).toContain("Anchorage");
+  });
+
+  it("ranks by the number of turns", async () => {
+    for (let i = 0; i < 3; i++) {
+      await recordTurn(
+        turn({
+          sessionId: "s",
+          turnIndex: i,
+          prompt: "how congested is SFO",
+          toolTrace: [{ name: "explainScore", arguments: { iata: "SFO" }, ok: true, durationMs: 2 }],
+        }),
+      );
+    }
+    await recordTurn(
+      turn({
+        sessionId: "s",
+        turnIndex: 3,
+        prompt: "what about ATL",
+        toolTrace: [{ name: "explainScore", arguments: { iata: "ATL" }, ok: true, durationMs: 2 }],
+      }),
+    );
+
+    const result = await airportDistribution();
+    expect(result.data[0].code).toBe("SFO");
+    expect(result.data[0].turns).toBe(3);
+    expect(result.data.find((row) => row.code === "ATL")!.turns).toBe(1);
+  });
+
+  it("takes shares of turns that named an airport, not of the whole window", async () => {
+    await recordTurn(
+      turn({
+        sessionId: "a",
+        turnIndex: 0,
+        prompt: "how congested is SFO",
+        toolTrace: [{ name: "explainScore", arguments: { iata: "SFO" }, ok: true, durationMs: 2 }],
+      }),
+    );
+    // A turn naming no airport at all — most questions are like this.
+    await recordTurn(
+      turn({ sessionId: "a", turnIndex: 1, prompt: "how is the score computed?", toolTrace: [] }),
+    );
+
+    const result = await airportDistribution();
+    // 1 of 1 airport-naming turns, not 1 of 2 turns.
+    expect(result.data.find((row) => row.code === "SFO")!.share).toBeCloseTo(1, 6);
+    expect(result.caveats.some((c) => c.includes("named an airport"))).toBe(true);
+  });
+
+  it("ignores airports that only appear in a tool result", async () => {
+    // The module's central rule, asserted end to end: a ranking returns many airports and names
+    // none of them in its arguments, so the turn contributes no entities.
+    await recordTurn(
+      turn({
+        sessionId: "a",
+        turnIndex: 0,
+        prompt: "which airports in New England are candidates?",
+        toolTrace: [
+          { name: "rankAirports", arguments: { region: "new_england", limit: 10 }, ok: true, durationMs: 9 },
+        ],
+      }),
+    );
+    expect((await airportDistribution()).data).toEqual([]);
+  });
+});
+
+describe("unresolvedPhrasings and coverageGaps", () => {
+  it("keeps what the user typed when it resolves to nothing", async () => {
+    await recordTurn(
+      turn({
+        sessionId: "a",
+        turnIndex: 0,
+        prompt: "how is LA doing?",
+        toolTrace: [{ name: "resolveAirport", arguments: { query: "LA" }, ok: true, durationMs: 1 }],
+      }),
+    );
+
+    const result = await unresolvedPhrasings();
+    expect(result.data).toEqual([{ phrase: "la", turns: 1 }]);
+  });
+
+  it("separates a code with no data from a phrasing", async () => {
+    await recordTurn(
+      turn({
+        sessionId: "a",
+        turnIndex: 0,
+        prompt: "what about ZZZ airport?",
+        toolTrace: [
+          { name: "getAirportMetrics", arguments: { iata: "ZZZ" }, ok: false, errorCode: "no_data_for_airport", durationMs: 1 },
+        ],
+      }),
+    );
+
+    expect((await coverageGaps()).data).toEqual([{ phrase: "ZZZ", turns: 1 }]);
+    expect((await unresolvedPhrasings()).data).toEqual([]);
+    // And it must not be counted as an airport we have data for.
+    expect((await airportDistribution()).data).toEqual([]);
   });
 });

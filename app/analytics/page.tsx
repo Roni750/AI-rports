@@ -1,9 +1,14 @@
+import { timingSafeEqual } from "node:crypto";
+
 import Link from "next/link";
 import { connection } from "next/server";
 
 import { PRICES_CHECKED_ON } from "../../lib/analytics/pricing";
 import {
+  airportDistribution,
   classifierHealth,
+  coverageGaps,
+  unresolvedPhrasings,
   formatUsd,
   needsReview,
   overview,
@@ -12,11 +17,12 @@ import {
   toolUsage,
   topicDistribution,
   volumeByDay,
+  windowSample,
   type AnalyticsEnvelope,
   type AnalyticsQuery,
 } from "../../lib/analytics/queries";
 import { analyticsStatus } from "../../lib/analytics/store";
-import { TopicBars, ToolBars, VolumeArea } from "./charts";
+import { AirportBars, TopicBars, ToolBars, VolumeArea } from "./charts";
 
 /**
  * Conversation analytics.
@@ -43,30 +49,97 @@ const ORIGINS = [
   { label: "Real only", value: "live" },
 ];
 
+/** Every origin the query layer will accept. Anything else is a typo or a probe, never a filter. */
+const VALID_ORIGINS = ["all", "live", "replay", "synthetic"] as const;
+
+/** Longest window the UI offers, and the ceiling any hand-written `?days=` is clamped to. */
+const MAX_DAYS = 3650;
+
+/**
+ * Read `?days=` without trusting it.
+ *
+ * The value reaches `new Date(Date.parse(toIso) - days * DAY_MS)` in the query layer, where a NaN
+ * or a number past the ±8.64e15 ms range throws `RangeError: Invalid time value`. In a server
+ * component that is an unhandled 500, which means any visitor could take the page down with a URL.
+ * Falling back to the default is the right answer: a malformed window is a bad request, not a
+ * reason to stop rendering.
+ */
+function parseDays(raw: string | undefined): number {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 30;
+  return Math.min(Math.floor(parsed), MAX_DAYS);
+}
+
+/**
+ * Read `?origin=` without trusting it.
+ *
+ * An unrecognised value used to be cast straight into the SQL predicate, where it matched nothing
+ * and rendered an entirely zeroed dashboard — the failure mode where a reader concludes "no
+ * traffic" from what is really "no such filter".
+ */
+function parseOrigin(raw: string | undefined): NonNullable<AnalyticsQuery["origin"]> {
+  return (VALID_ORIGINS as readonly string[]).includes(raw ?? "")
+    ? (raw as NonNullable<AnalyticsQuery["origin"]>)
+    : "all";
+}
+
+/**
+ * Compare the supplied token to the configured one without leaking its length or contents.
+ *
+ * `!==` on strings short-circuits at the first differing byte, which is a timing oracle for a
+ * secret an attacker can submit repeatedly. `timingSafeEqual` needs equal-length buffers, so the
+ * length check happens first and deliberately — length is the one thing this cannot hide.
+ */
+function tokenMatches(supplied: string | undefined, required: string): boolean {
+  if (supplied === undefined) return false;
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(required);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 export default async function AnalyticsPage({ searchParams }: PageProps<"/analytics">) {
   await connection();
 
   const params = await searchParams;
-  const days = Number(first(params.days) ?? 30);
-  const origin = (first(params.origin) ?? "all") as NonNullable<AnalyticsQuery["origin"]>;
+  const days = parseDays(first(params.days));
+  const origin = parseOrigin(first(params.origin));
+  const token = first(params.token);
 
   // The window is expressed in days and resolved to timestamps inside the query layer. Reading the
   // clock during render is impure — two calls in one render could land either side of a boundary.
   const query: AnalyticsQuery = { days, origin };
 
   // Recorded prompts are user content. When ANALYTICS_TOKEN is set the dashboard requires it,
-  // which is what makes a public deployment defensible; left unset, the page is open so local
-  // development needs no ceremony. Not authentication — a shared secret in a query string is a
-  // gate, not an identity — and DESIGN.md says so rather than implying otherwise.
+  // which is what makes a public deployment defensible. Not authentication — a shared secret in a
+  // query string is a gate, not an identity — and DESIGN.md says so rather than implying otherwise.
+  //
+  // Unset behaves differently by environment, and that asymmetry is the point. Locally the page
+  // stays open so development needs no ceremony. In production it CLOSES, because the previous
+  // behaviour made a forgotten environment variable publish recorded prompts, session ids and
+  // spend to anyone who found the URL — and the variable is commented out in `.env.local.example`,
+  // so unset is the state a deploy arrives in by default. Missing security configuration should
+  // fail towards the locked door.
   const requiredToken = process.env.ANALYTICS_TOKEN;
-  if (requiredToken && first(params.token) !== requiredToken) {
+  const gated = requiredToken ? !tokenMatches(token, requiredToken) : isProduction();
+
+  if (gated) {
     return (
-      <Shell days={days} origin={origin}>
+      <Shell days={days} origin={origin} token={token}>
         <div role="alert" className="rounded-lg border border-current/20 px-4 py-3 text-sm">
           <p className="font-medium">This dashboard is gated.</p>
           <p className="mt-1 opacity-70">
-            It shows recorded user prompts, so it is not published openly. Append{" "}
-            <code className="font-mono">?token=…</code> with the value of ANALYTICS_TOKEN.
+            {requiredToken ? (
+              <>
+                It shows recorded user prompts, so it is not published openly. Append{" "}
+                <code className="font-mono">?token=…</code> with the value of ANALYTICS_TOKEN.
+              </>
+            ) : (
+              <>
+                It shows recorded user prompts, and no{" "}
+                <code className="font-mono">ANALYTICS_TOKEN</code> is configured on this deployment.
+                Set one and restart — an unset token closes this page rather than opening it.
+              </>
+            )}
           </p>
         </div>
       </Shell>
@@ -76,7 +149,7 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
   const status = await analyticsStatus();
   if (!status.enabled) {
     return (
-      <Shell days={days} origin={origin}>
+      <Shell days={days} origin={origin} token={token}>
         <div role="alert" className="rounded-lg border border-red-500/40 bg-red-500/5 px-4 py-3 text-sm">
           <p className="font-medium">Analytics storage is unavailable.</p>
           {/* Naming the reason matters: "no data yet" and "the database is unreachable" render
@@ -87,19 +160,28 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
     );
   }
 
-  const [kpis, topics, volume, health, tools, quality, review, sessions] = await Promise.all([
-    overview(query),
-    topicDistribution(query),
-    volumeByDay(query),
-    classifierHealth(query),
-    toolUsage(query),
-    reliability(query),
-    needsReview(query),
-    recentSessions(query),
+  // One sample for the whole page. Every envelope below needs the window's turn count and seeded
+  // share, and each aggregate will compute its own when not given one — which meant eight
+  // identical full-window scans per render, on top of the eight aggregates they exist to caveat.
+  const sample = await windowSample(query);
+
+  const [kpis, topics, volume, health, tools, quality, review, sessions, airports, phrasings, gaps] =
+    await Promise.all([
+    overview(query, sample),
+    topicDistribution(query, sample),
+    volumeByDay(query, sample),
+    classifierHealth(query, sample),
+    toolUsage(query, sample),
+    reliability(query, sample),
+    needsReview(query, undefined, sample),
+    recentSessions(query, undefined, sample),
+    airportDistribution(query, sample),
+    unresolvedPhrasings(query, sample),
+    coverageGaps(query, sample),
   ]);
 
   return (
-    <Shell days={days} origin={origin}>
+    <Shell days={days} origin={origin} token={token}>
       {kpis.seededShare > 0 && (
         <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-3 text-sm">
           <p className="font-medium">This view includes seeded traffic.</p>
@@ -107,7 +189,7 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
             {(kpis.seededShare * 100).toFixed(0)}% of turns in this window were replayed from a
             scripted corpus rather than asked by a user. Tool calls, tokens and latencies are real
             measurements; only the questions were scripted.{" "}
-            <Link href="/analytics?origin=live" className="underline decoration-dotted">
+            <Link href={href({ days, origin: "live", token })} className="underline decoration-dotted">
               Show real traffic only
             </Link>
             .
@@ -169,7 +251,90 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
         </table>
       </Panel>
 
-      {/* ------------- 3. volume */}
+      {/* ------------- 3. the other dimension: what the questions were about */}
+      <Panel
+        title="Airports asked about"
+        subtitle="Topics say what kind of question; this says what it was about. Counted from the prompt and the tool arguments only — never from what a tool returned."
+        envelope={airports}
+      >
+        <AirportBars data={airports.data} />
+        {airports.data.length > 0 && (
+          <table className="mt-4 w-full text-xs">
+            <thead className="opacity-60">
+              <tr>
+                <Th>Airport</Th>
+                <Th align="right">Turns</Th>
+                <Th align="right">Share</Th>
+                <Th align="right">Named by user</Th>
+                <Th align="right">Resolved by agent</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {airports.data.slice(0, 15).map((a) => (
+                <tr key={a.code} className="border-t border-current/10">
+                  <Td>
+                    <span className="font-mono">{a.code}</span>
+                    {a.label ? <span className="ml-2 opacity-60">{a.label}</span> : null}
+                  </Td>
+                  <Td align="right">{a.turns}</Td>
+                  <Td align="right">{(a.share * 100).toFixed(0)}%</Td>
+                  <Td align="right">{a.promptTurns}</Td>
+                  <Td align="right">{a.toolTurns}</Td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {/*
+          The two columns overlap rather than partition: a turn naming an airport AND passing it
+          to a tool counts in both. Said here rather than drawn, because a stacked bar would
+          silently double most of them.
+        */}
+        <p className="mt-3 text-xs opacity-60">
+          The last two columns overlap — a turn can both name an airport and resolve to it, so they
+          do not sum to the turn count. A high &quot;resolved by agent&quot; against a low &quot;named
+          by user&quot; means the agent reached somewhere nobody asked for by name.
+        </p>
+
+        {(phrasings.data.length > 0 || gaps.data.length > 0) && (
+          <div className="mt-4 grid gap-4 sm:grid-cols-2">
+            {phrasings.data.length > 0 && (
+              <div>
+                <h3 className="text-xs font-semibold">What people type instead of a code</h3>
+                <p className="mt-0.5 text-xs opacity-60">
+                  Captured before resolution, because resolving is what destroys it.
+                </p>
+                <ul className="mt-2 flex flex-col gap-1 text-xs">
+                  {phrasings.data.slice(0, 8).map((p) => (
+                    <li key={p.phrase} className="flex justify-between border-t border-current/10 pt-1">
+                      <span className="font-mono">&quot;{p.phrase}&quot;</span>
+                      <span className="tabular-nums opacity-70">{p.turns}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {gaps.data.length > 0 && (
+              <div>
+                <h3 className="text-xs font-semibold">Asked about, no data</h3>
+                <p className="mt-0.5 text-xs opacity-60">
+                  A coverage gap rather than a bug: the dataset does not reach these.
+                </p>
+                <ul className="mt-2 flex flex-col gap-1 text-xs">
+                  {gaps.data.slice(0, 8).map((g) => (
+                    <li key={g.phrase} className="flex justify-between border-t border-current/10 pt-1">
+                      <span className="font-mono">{g.phrase}</span>
+                      <span className="tabular-nums opacity-70">{g.turns}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+      </Panel>
+
+      {/* ------------- 4. volume */}
       <Panel
         title="Volume"
         subtitle="Turns and sessions per day. The gap between them is how often people follow up."
@@ -178,7 +343,7 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
         <VolumeArea data={volume.data} />
       </Panel>
 
-      {/* ------------- 4. reliability */}
+      {/* ------------- 5. reliability */}
       <Panel
         title="Reliability"
         subtitle="Which step degrades, and what per-step reliability implies end to end."
@@ -213,7 +378,7 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
         )}
       </Panel>
 
-      {/* ------------- 5. tools */}
+      {/* ------------- 6. tools */}
       <Panel
         title="Tool usage"
         subtitle="Which tools the model actually reaches for, and what each costs in time."
@@ -244,7 +409,7 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
         </table>
       </Panel>
 
-      {/* ------------- 6. the classifier, reporting on itself */}
+      {/* ------------- 7. the classifier, reporting on itself */}
       <Panel
         title="Classifier health"
         subtitle="How labels were produced, and what producing them cost."
@@ -265,7 +430,7 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
         </p>
       </Panel>
 
-      {/* ------------- 7. the loop back to the eval */}
+      {/* ------------- 8. the loop back to the eval */}
       <Panel
         title="Needs review"
         subtitle="Lowest-confidence prompts. These are the next gold-set entries, not a backlog."
@@ -297,7 +462,7 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
         )}
       </Panel>
 
-      {/* ------------- 8. sessions */}
+      {/* ------------- 9. sessions */}
       <Panel title="Recent sessions" subtitle="One row per conversation." envelope={sessions}>
         <table className="w-full text-xs">
           <thead className="opacity-60">
@@ -335,14 +500,38 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
 // Server components, all of them. They exist to keep the page readable, not because anything here
 // needs interactivity.
 
+/**
+ * Build a dashboard URL that keeps every parameter the current view depends on.
+ *
+ * Including the token, which is the whole reason this exists. The filter chips used to rebuild the
+ * URL from `days` and `origin` alone, so on any deployment with ANALYTICS_TOKEN set, clicking any
+ * filter navigated to a URL without it and landed on the gate — leaving the gated dashboard with
+ * no working navigation at all.
+ */
+function href({
+  days,
+  origin,
+  token,
+}: {
+  days: number;
+  origin: string;
+  token: string | undefined;
+}): string {
+  const params = new URLSearchParams({ days: String(days), origin });
+  if (token !== undefined) params.set("token", token);
+  return `/analytics?${params.toString()}`;
+}
+
 function Shell({
   children,
   days,
   origin,
+  token,
 }: {
   children: React.ReactNode;
   days: number;
   origin: string;
+  token: string | undefined;
 }) {
   return (
     <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-6 px-4 py-6">
@@ -361,7 +550,7 @@ function Shell({
           {WINDOWS.map((w) => (
             <Link
               key={w.days}
-              href={`/analytics?days=${w.days}&origin=${origin}`}
+              href={href({ days: w.days, origin, token })}
               className={chip(days === w.days)}
             >
               {w.label}
@@ -371,7 +560,7 @@ function Shell({
           {ORIGINS.map((o) => (
             <Link
               key={o.value}
-              href={`/analytics?days=${days}&origin=${o.value}`}
+              href={href({ days, origin: o.value, token })}
               className={chip(origin === o.value)}
             >
               {o.label}
@@ -468,4 +657,14 @@ function pct(x: number): string {
 
 function first(v: string | string[] | undefined): string | undefined {
   return Array.isArray(v) ? v[0] : v;
+}
+
+/**
+ * Whether this is a deployed build, which decides what an unset ANALYTICS_TOKEN means.
+ *
+ * `next build` sets NODE_ENV to "production", so a local `next dev` session is never caught by
+ * this and the open-by-default convenience survives where it was intended.
+ */
+function isProduction(): boolean {
+  return process.env.NODE_ENV === "production";
 }

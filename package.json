@@ -19,6 +19,7 @@
     "analytics:migrate": "tsx scripts/analytics-migrate.ts",
     "analytics:classify": "tsx scripts/classify-turns.ts",
     "analytics:seed": "tsx scripts/seed-analytics.ts",
+    "analytics:entities": "tsx scripts/backfill-entities.ts",
     "analytics:prune": "tsx scripts/analytics-prune.ts",
     "eval:topics": "tsx scripts/eval-topics.ts",
     "models": "tsx scripts/list-models.ts"

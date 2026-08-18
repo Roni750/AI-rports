@@ -308,3 +308,74 @@ export function findAirportsByStates(states: readonly string[]): AirportYear[] {
     .all(YEARS.current, ...states.map((s) => s.toUpperCase())) as unknown as AirportYearRow[];
   return rows.map(toAirportYear);
 }
+
+/**
+ * The reference data an entity extractor needs: which IATA codes are real, and what each
+ * airport's city is called.
+ *
+ * Exists so the analytics layer can recognise "Anchorage" and "ANC" in a prompt without shipping
+ * a second copy of the airport list. Recognition is a lookup, not a judgement — there is no reason
+ * for a language model to be involved in deciding whether ANC is an airport.
+ *
+ * Loaded once and cached: the map is a few hundred entries and never changes within a process.
+ */
+export interface AirportLookup {
+  /** Every valid US IATA code in the current year, uppercase. */
+  codes: ReadonlySet<string>;
+  /** Lowercased city name -> the busiest IATA serving it. */
+  cityToIata: ReadonlyMap<string, string>;
+  /** IATA -> display city, for labelling a code in the UI. */
+  iataToCity: ReadonlyMap<string, string>;
+}
+
+let cachedLookup: AirportLookup | null = null;
+
+export function loadAirportLookup(): AirportLookup {
+  if (cachedLookup) return cachedLookup;
+
+  const rows = connect()
+    .prepare(
+      `SELECT iata, city, passengers FROM airport_year
+       WHERE year = ? AND country = 'US' AND iata IS NOT NULL
+       ORDER BY passengers DESC`,
+    )
+    .all(YEARS.current) as unknown as { iata: string; city: string | null; passengers: number }[];
+
+  const codes = new Set<string>();
+  const cityToIata = new Map<string, string>();
+  const iataToCity = new Map<string, string>();
+
+  for (const row of rows) {
+    const iata = row.iata?.toUpperCase();
+    if (!iata || iata.length !== 3) continue;
+    codes.add(iata);
+
+    if (!row.city) continue;
+    if (!iataToCity.has(iata)) iataToCity.set(iata, row.city);
+
+    // BTS writes the city WITH its state — "Anchorage, AK", "Dallas/Fort Worth, TX". Keying on the
+    // raw string is the obvious mistake and a silent one: nobody types "anchorage, ak", so every
+    // city lookup misses and the whole feature reports zero without erroring.
+    //
+    // Two keys per airport, so both phrasings resolve:
+    //   "anchorage"     — the bare name, what people actually type
+    //   "anchorage ak"  — name plus state, which disambiguates Portland OR from Portland ME
+    const [namePart, statePart] = row.city.split(",");
+    // "Dallas/Fort Worth" — take the first alternative as the primary name.
+    const name = namePart.split("/")[0].trim().toLowerCase();
+    const state = statePart?.trim().toLowerCase() ?? "";
+
+    // Rows are ordered by passengers, so the first writer wins: bare "Chicago" maps to ORD rather
+    // than MDW, and bare "Portland" to whichever is busier. Genuine ambiguity between them belongs
+    // to the agent's own resolver, not to a recognition table — this only has to recognise that a
+    // city was named at all.
+    if (name.length >= 4 && !cityToIata.has(name)) cityToIata.set(name, iata);
+    if (name.length >= 4 && state) {
+      const qualified = `${name} ${state}`;
+      if (!cityToIata.has(qualified)) cityToIata.set(qualified, iata);
+    }
+  }
+
+  cachedLookup = { codes, cityToIata, iataToCity };
+  return cachedLookup;
+}

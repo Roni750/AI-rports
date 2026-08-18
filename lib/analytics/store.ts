@@ -17,8 +17,9 @@ import { TAXONOMY_VERSION, TOPICS } from "./taxonomy";
  * SQLite's dialect, so the DDL in `migrations.ts` is identical in both.
  *
  * EVERY EXPORT HERE IS FAILURE-TOLERANT. If the database cannot be reached, calls resolve to empty
- * results and record a reason instead of throwing. Analytics is a passenger: it may not break the
- * product it measures.
+ * results and record a reason instead of throwing. The single, deliberate exception is a statement
+ * the database rejects: `write` lets that through, so a violated constraint is not silently lost.
+ * Analytics is a passenger: it may not break the product it measures.
  */
 
 const DEFAULT_URL = "file:data/analytics.db";
@@ -194,7 +195,19 @@ export async function query(sql: string, args: InArgs = []): Promise<Row[]> {
   }
 }
 
-/** A write batch. Returns false when the write did not happen, so callers can log it. */
+/**
+ * A write batch. Returns false when the store is unavailable, so callers can log it.
+ *
+ * The false-vs-throw split is deliberate and it is the one place this module's failure tolerance
+ * stops short of total. An unreachable database returns false, like every other export here. A
+ * statement the database actively REJECTS throws, because that is a constraint doing its job:
+ * `turn_topic`'s composite foreign key exists to catch a taxonomy rename that leaves labels
+ * dangling, and swallowing that would turn the guarantee back into documentation. `store.test.ts`
+ * pins both halves.
+ *
+ * A caller that must survive a rejection mid-batch — a long classification run that has already
+ * spent real tokens — is therefore responsible for catching. See `scripts/classify-turns.ts`.
+ */
 export async function write(
   statements: readonly { sql: string; args: InArgs }[],
 ): Promise<boolean> {
@@ -252,6 +265,14 @@ export async function analyticsStatus(): Promise<AnalyticsStatus> {
  * Exported for tests only. Production code has exactly one database for the life of the process.
  */
 export function resetStoreForTests(): void {
+  // Close before dropping the reference. Without this each reset leaks a libSQL connection — and
+  // on Windows, a lock on the database file — which is the failure the global pinning above exists
+  // to avoid in the first place.
+  try {
+    globalForStore.__analyticsStore?.client?.close();
+  } catch {
+    // A client that cannot be closed is already unusable; dropping it is the whole point.
+  }
   globalForStore.__analyticsStore = {
     client: null,
     disabledReason: null,

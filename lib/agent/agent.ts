@@ -5,6 +5,7 @@ import {
 	type MustMention,
 	type RequiredContextCheck,
 } from "../tools/must-mention";
+import {type ChartPayload, payloadFor} from "../tools/chart-payload";
 import {dispatchTool, TOOL_SCHEMAS} from "./tool-schemas";
 import {systemPrompt} from "./system-prompt";
 
@@ -136,6 +137,14 @@ export interface ToolTraceEntry {
 	/** Error code when the call failed, so failures are legible in the trace. */
 	errorCode?: string;
 	durationMs: number;
+	/**
+	 * The tool's own result, for the interface to draw.
+	 *
+	 * Deliberately the FULL result, not the compacted one sent to the model: compaction
+	 * rounds numbers and drops nulls, which is right for a prompt and wrong for a chart.
+	 * Absent on failure, and on tools with no visual treatment.
+	 */
+	payload?: ChartPayload;
 }
 
 /**
@@ -473,12 +482,15 @@ export async function runAgent(
 
 			if (result.ok && result.mustMention) collectedMustMention.push(...result.mustMention);
 
+			const payload = payloadFor(call.function.name, result);
+
 			trace.push({
 				name: call.function.name,
 				arguments: args,
 				ok: result.ok,
 				...(result.ok ? {} : {errorCode: result.code}),
 				durationMs: Date.now() - started,
+				...(payload ? {payload} : {}),
 			});
 
 			messages.push({

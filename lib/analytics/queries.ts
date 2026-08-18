@@ -166,8 +166,25 @@ function envelope(
   };
 }
 
-/** Sample size and seeded count for a window, used by every envelope. */
-async function sampleOf(r: ResolvedQuery): Promise<{ total: number; seeded: number }> {
+/** Sample size and seeded count for a window. Every envelope on the page is built from one. */
+export interface Sample {
+  total: number;
+  seeded: number;
+}
+
+/**
+ * Compute the window's sample once, for a caller about to run several aggregates over it.
+ *
+ * Each function below computes its own when none is passed, which keeps them independently
+ * callable. But the dashboard runs all eight against the SAME window in one `Promise.all`, and
+ * eight identical full-window COUNT/SUM scans is eight round trips — against the libSQL HTTP
+ * deployment this module is built for, eight separate HTTP requests — to learn one number.
+ */
+export async function windowSample(q: AnalyticsQuery = {}): Promise<Sample> {
+  return sampleOf(resolve(q));
+}
+
+async function sampleOf(r: ResolvedQuery): Promise<Sample> {
   const f = turnFilter(r);
   const rows = await query(
     `SELECT COUNT(*) AS n,
@@ -195,10 +212,13 @@ export interface Overview {
   errorRate: number;
 }
 
-export async function overview(q: AnalyticsQuery = {}): Promise<Analytics<Overview>> {
+export async function overview(
+  q: AnalyticsQuery = {},
+  sample?: Sample,
+): Promise<Analytics<Overview>> {
   const r = resolve(q);
   const f = turnFilter(r);
-  const sample = await sampleOf(r);
+  const counted = sample ?? (await sampleOf(r));
 
   const rows = await query(
     `SELECT COUNT(*) AS turns,
@@ -208,25 +228,29 @@ export async function overview(q: AnalyticsQuery = {}): Promise<Analytics<Overvi
             SUM(t.cost_usd) AS total_cost,
             SUM(CASE WHEN t.cost_usd IS NULL THEN 1 ELSE 0 END) AS unpriced,
             SUM(CASE WHEN t.outcome = 'truncated' THEN 1 ELSE 0 END) AS truncated,
-            SUM(CASE WHEN t.outcome = 'error' THEN 1 ELSE 0 END) AS errored
+            SUM(CASE WHEN t.outcome = 'error' AND t.error_kind IS NOT 'cancelled' THEN 1 ELSE 0 END) AS errored,
+            SUM(CASE WHEN t.error_kind = 'cancelled' THEN 1 ELSE 0 END) AS cancelled
      FROM turn t JOIN session s ON s.session_id = t.session_id
      WHERE ${f.sql}`,
     f.args,
   );
 
-  // SQLite has no percentile function, so the latencies are ordered and indexed directly. At these
-  // volumes reading the column is cheaper than any approximation would be to explain.
-  const latencies = (
-    await query(
-      `SELECT t.total_ms FROM turn t JOIN session s ON s.session_id = t.session_id
-       WHERE ${f.sql} ORDER BY t.total_ms`,
-      f.args,
-    )
-  ).map((row) => num(row.total_ms));
-
   const row = rows[0] ?? {};
   const turns = num(row.turns);
   const unpriced = num(row.unpriced);
+  // Cancellations leave neither numerator nor denominator. A user closing the tab says nothing
+  // about whether the agent would have answered, so counting it either way misstates the rate.
+  const rated = turns - num(row.cancelled);
+
+  // SQLite has no percentile function, so the ordering is done in SQL and the row is picked by
+  // OFFSET. Reading the whole `total_ms` column into JavaScript also works and is easier to read,
+  // but it makes the cost of rendering this page grow with the retention window: at 90 days and
+  // the "All time" chip, that is every turn ever recorded transferred to index two of them. Two
+  // one-row queries are constant regardless of how much history exists.
+  const [p50TotalMs, p95TotalMs] = await Promise.all([
+    percentileFromDb(f, turns, 0.5),
+    percentileFromDb(f, turns, 0.95),
+  ]);
 
   const extra: string[] = [];
   if (unpriced > 0 && turns > 0) {
@@ -237,28 +261,52 @@ export async function overview(q: AnalyticsQuery = {}): Promise<Analytics<Overvi
   }
 
   return {
-    ...envelope("one chat turn", r, sample.total, sample.seeded, { extra }),
+    ...envelope("one chat turn", r, counted.total, counted.seeded, { extra }),
     data: {
       turns,
       sessions: num(row.sessions),
       turnsPerSession: num(row.sessions) === 0 ? 0 : turns / num(row.sessions),
-      p50TotalMs: percentile(latencies, 0.5),
-      p95TotalMs: percentile(latencies, 0.95),
+      p50TotalMs,
+      p95TotalMs,
       meanTokensPerTurn: nullableNum(row.mean_tokens),
       meanCostUsd: nullableNum(row.mean_cost),
       totalCostUsd: nullableNum(row.total_cost),
       unpricedTurns: unpriced,
       truncationRate: turns === 0 ? 0 : num(row.truncated) / turns,
-      errorRate: turns === 0 ? 0 : num(row.errored) / turns,
+      errorRate: rated <= 0 ? 0 : num(row.errored) / rated,
     },
   };
 }
 
-/** Nearest-rank percentile. Exported so the dashboard and the tests agree on the definition. */
+/**
+ * Nearest-rank percentile over an in-memory array.
+ *
+ * Retained as the definition of record: `percentileFromDb` below must agree with it, and a test
+ * can check this one without a database. The two are kept in step by `rankIndex`.
+ */
 export function percentile(sorted: readonly number[], p: number): number {
   if (sorted.length === 0) return 0;
-  const rank = Math.ceil(p * sorted.length);
-  return sorted[Math.min(Math.max(rank, 1), sorted.length) - 1];
+  return sorted[rankIndex(sorted.length, p)];
+}
+
+/** Zero-based index of the nearest-rank percentile in an ascending run of `n` values. */
+function rankIndex(n: number, p: number): number {
+  return Math.min(Math.max(Math.ceil(p * n), 1), n) - 1;
+}
+
+/** The same percentile, chosen by the database so only the one row crosses the wire. */
+async function percentileFromDb(
+  f: { sql: string; args: InValue[] },
+  n: number,
+  p: number,
+): Promise<number> {
+  if (n === 0) return 0;
+  const rows = await query(
+    `SELECT t.total_ms FROM turn t JOIN session s ON s.session_id = t.session_id
+     WHERE ${f.sql} ORDER BY t.total_ms LIMIT 1 OFFSET ?`,
+    [...f.args, rankIndex(n, p)],
+  );
+  return num(rows[0]?.total_ms);
 }
 
 // ------------- 2. the umbrella view
@@ -277,17 +325,19 @@ export interface TopicRow {
 
 export async function topicDistribution(
   q: AnalyticsQuery = {},
+  sample?: Sample,
 ): Promise<Analytics<TopicRow[]>> {
   const r = resolve(q);
   const f = turnFilter(r);
-  const sample = await sampleOf(r);
+  const counted = sample ?? (await sampleOf(r));
 
   const rows = await query(
     `SELECT tt.topic_id,
             COUNT(*) AS turns,
             AVG(tt.confidence) AS mean_confidence,
             SUM(CASE WHEN tt.stage = 'llm' THEN 1 ELSE 0 END) AS llm_labels,
-            SUM(CASE WHEN t.outcome = 'error' THEN 1 ELSE 0 END) AS errored,
+            SUM(CASE WHEN t.outcome = 'error' AND t.error_kind IS NOT 'cancelled' THEN 1 ELSE 0 END) AS errored,
+            SUM(CASE WHEN t.error_kind = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
             AVG(t.cost_usd) AS mean_cost
      FROM turn t
      JOIN session s ON s.session_id = t.session_id
@@ -313,14 +363,14 @@ export async function topicDistribution(
       share: labelled === 0 ? 0 : turns / labelled,
       meanConfidence: num(row?.mean_confidence),
       llmShare: turns === 0 ? 0 : num(row?.llm_labels) / turns,
-      errorRate: turns === 0 ? 0 : num(row?.errored) / turns,
+      errorRate: turns - num(row?.cancelled) <= 0 ? 0 : num(row?.errored) / (turns - num(row?.cancelled)),
       meanCostUsd: nullableNum(row?.mean_cost),
     };
   }).sort((a, b) => b.turns - a.turns);
 
   const extra: string[] = [];
-  if (sample.total > labelled) {
-    const missing = sample.total - labelled;
+  if (counted.total > labelled) {
+    const missing = counted.total - labelled;
     extra.push(
       `${missing} ${missing === 1 ? "turn has" : "turns have"} no label for classifier ` +
         `${r.classifierVersion} and ${missing === 1 ? "is" : "are"} excluded. ` +
@@ -329,7 +379,7 @@ export async function topicDistribution(
   }
 
   return {
-    ...envelope("one topic", r, sample.total, sample.seeded, { extra }),
+    ...envelope("one topic", r, counted.total, counted.seeded, { extra }),
     data,
   };
 }
@@ -342,10 +392,13 @@ export interface DayRow {
   sessions: number;
 }
 
-export async function volumeByDay(q: AnalyticsQuery = {}): Promise<Analytics<DayRow[]>> {
+export async function volumeByDay(
+  q: AnalyticsQuery = {},
+  sample?: Sample,
+): Promise<Analytics<DayRow[]>> {
   const r = resolve(q);
   const f = turnFilter(r);
-  const sample = await sampleOf(r);
+  const counted = sample ?? (await sampleOf(r));
 
   const rows = await query(
     `SELECT substr(t.created_at, 1, 10) AS day,
@@ -358,7 +411,7 @@ export async function volumeByDay(q: AnalyticsQuery = {}): Promise<Analytics<Day
   );
 
   return {
-    ...envelope("one day", r, sample.total, sample.seeded, { trend: true }),
+    ...envelope("one day", r, counted.total, counted.seeded, { trend: true }),
     data: rows.map((row) => ({
       day: String(row.day),
       turns: num(row.turns),
@@ -389,16 +442,20 @@ export interface Reliability {
   compounding: string | null;
 }
 
-export async function reliability(q: AnalyticsQuery = {}): Promise<Analytics<Reliability>> {
+export async function reliability(
+  q: AnalyticsQuery = {},
+  sample?: Sample,
+): Promise<Analytics<Reliability>> {
   const r = resolve(q);
   const f = turnFilter(r);
-  const sample = await sampleOf(r);
+  const counted = sample ?? (await sampleOf(r));
 
   const rows = await query(
     `SELECT COUNT(*) AS turns,
             SUM(CASE WHEN t.outcome = 'answered' THEN 1 ELSE 0 END) AS answered,
             SUM(CASE WHEN t.outcome = 'truncated' THEN 1 ELSE 0 END) AS truncated,
-            SUM(CASE WHEN t.outcome = 'error' THEN 1 ELSE 0 END) AS errored,
+            SUM(CASE WHEN t.outcome = 'error' AND t.error_kind IS NOT 'cancelled' THEN 1 ELSE 0 END) AS errored,
+            SUM(CASE WHEN t.error_kind = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
             SUM(t.tool_calls) AS tool_calls,
             SUM(t.tool_failures) AS tool_failures,
             SUM(CASE WHEN t.tool_calls = 0 AND t.outcome != 'error' THEN 1 ELSE 0 END) AS zero_tool,
@@ -427,12 +484,12 @@ export async function reliability(q: AnalyticsQuery = {}): Promise<Analytics<Rel
   }
 
   return {
-    ...envelope("the whole window", r, sample.total, sample.seeded),
+    ...envelope("the whole window", r, counted.total, counted.seeded),
     data: {
       turns,
       answeredRate: observedClean,
       truncationRate: turns === 0 ? 0 : num(row.truncated) / turns,
-      errorRate: turns === 0 ? 0 : num(row.errored) / turns,
+      errorRate: turns - num(row.cancelled) <= 0 ? 0 : num(row.errored) / (turns - num(row.cancelled)),
       toolCallSuccessRate: successRate,
       meanToolCallsPerTurn: meanCalls,
       zeroToolAnswerRate: turns === 0 ? 0 : num(row.zero_tool) / turns,
@@ -452,10 +509,13 @@ export interface ToolUsageRow {
   maxDurationMs: number;
 }
 
-export async function toolUsage(q: AnalyticsQuery = {}): Promise<Analytics<ToolUsageRow[]>> {
+export async function toolUsage(
+  q: AnalyticsQuery = {},
+  sample?: Sample,
+): Promise<Analytics<ToolUsageRow[]>> {
   const r = resolve(q);
   const f = turnFilter(r);
-  const sample = await sampleOf(r);
+  const counted = sample ?? (await sampleOf(r));
 
   const rows = await query(
     `SELECT c.tool_name,
@@ -472,7 +532,7 @@ export async function toolUsage(q: AnalyticsQuery = {}): Promise<Analytics<ToolU
   );
 
   return {
-    ...envelope("one tool", r, sample.total, sample.seeded),
+    ...envelope("one tool", r, counted.total, counted.seeded),
     data: rows.map((row) => ({
       toolName: String(row.tool_name),
       calls: num(row.calls),
@@ -495,10 +555,11 @@ export interface ClassifierHealth {
 
 export async function classifierHealth(
   q: AnalyticsQuery = {},
+  sample?: Sample,
 ): Promise<Analytics<ClassifierHealth>> {
   const r = resolve(q);
   const f = turnFilter(r);
-  const sample = await sampleOf(r);
+  const counted = sample ?? (await sampleOf(r));
 
   const rows = await query(
     `SELECT tt.stage, COUNT(*) AS turns, SUM(tt.cost_usd) AS cost
@@ -513,7 +574,7 @@ export async function classifierHealth(
   const labelled = rows.reduce((sum, row) => sum + num(row.turns), 0);
 
   return {
-    ...envelope("one classifier stage", r, sample.total, sample.seeded),
+    ...envelope("one classifier stage", r, counted.total, counted.seeded),
     data: {
       activeVersion: r.classifierVersion,
       byStage: rows.map((row) => ({
@@ -523,7 +584,7 @@ export async function classifierHealth(
         costUsd: num(row.cost),
       })),
       labelledTurns: labelled,
-      unlabelledTurns: Math.max(sample.total - labelled, 0),
+      unlabelledTurns: Math.max(counted.total - labelled, 0),
       classificationCostUsd: rows.reduce((sum, row) => sum + num(row.cost), 0),
     },
   };
@@ -550,10 +611,11 @@ export interface ReviewRow {
 export async function needsReview(
   q: AnalyticsQuery = {},
   limit = 20,
+  sample?: Sample,
 ): Promise<Analytics<ReviewRow[]>> {
   const r = resolve(q);
   const f = turnFilter(r);
-  const sample = await sampleOf(r);
+  const counted = sample ?? (await sampleOf(r));
 
   const rows = await query(
     `SELECT t.turn_id, t.session_id, t.created_at, t.prompt,
@@ -568,7 +630,7 @@ export async function needsReview(
   );
 
   return {
-    ...envelope("one low-confidence turn", r, sample.total, sample.seeded),
+    ...envelope("one low-confidence turn", r, counted.total, counted.seeded),
     data: rows.map((row) => ({
       turnId: String(row.turn_id),
       sessionId: String(row.session_id),
@@ -596,10 +658,11 @@ export interface SessionRow {
 export async function recentSessions(
   q: AnalyticsQuery = {},
   limit = 25,
+  sample?: Sample,
 ): Promise<Analytics<SessionRow[]>> {
   const r = resolve(q);
   const f = turnFilter(r);
-  const sample = await sampleOf(r);
+  const counted = sample ?? (await sampleOf(r));
 
   const rows = await query(
     `SELECT s.session_id, s.origin, s.started_at,
@@ -618,7 +681,7 @@ export async function recentSessions(
   );
 
   return {
-    ...envelope("one session", r, sample.total, sample.seeded),
+    ...envelope("one session", r, counted.total, counted.seeded),
     data: rows.map((row) => ({
       sessionId: String(row.session_id),
       origin: String(row.origin),
@@ -633,3 +696,151 @@ export async function recentSessions(
 
 /** Re-exported so UI code formats money the same way the chat trace does. */
 export { formatUsd };
+
+// ------------- 9. entities: what the questions were about
+
+export interface AirportRow {
+  code: string;
+  label: string | null;
+  /** Distinct turns mentioning it, from either source. Not a row count. */
+  turns: number;
+  share: number;
+  /** Turns where the USER named it. */
+  promptTurns: number;
+  /** Turns where the AGENT resolved to it. */
+  toolTurns: number;
+}
+
+/**
+ * Which airports people ask about.
+ *
+ * The second analytics dimension. The topic taxonomy says what KIND of question was asked; this
+ * says what it was ABOUT, which no single-label topic classifier can carry without inventing a
+ * class per airport.
+ *
+ * `turns` counts DISTINCT turns rather than rows. An airport named in the prompt AND passed to a
+ * tool stores two rows on purpose — the split is informative — so counting rows would rank
+ * airports by how thoroughly they were processed rather than by how often they were asked about.
+ */
+export async function airportDistribution(
+  q: AnalyticsQuery = {},
+  sample?: Sample,
+): Promise<Analytics<AirportRow[]>> {
+  const r = resolve(q);
+  const f = turnFilter(r);
+  const counted = sample ?? (await sampleOf(r));
+
+  const rows = await query(
+    `SELECT e.code,
+            MAX(e.label) AS label,
+            COUNT(DISTINCT e.turn_id) AS turns,
+            COUNT(DISTINCT CASE WHEN e.source = 'prompt' THEN e.turn_id END) AS prompt_turns,
+            COUNT(DISTINCT CASE WHEN e.source = 'tool_arg' THEN e.turn_id END) AS tool_turns
+     FROM turn_entity e
+     JOIN turn t ON t.turn_id = e.turn_id
+     JOIN session s ON s.session_id = t.session_id
+     WHERE ${f.sql} AND e.entity_type = 'airport'
+     GROUP BY e.code
+     ORDER BY turns DESC, e.code`,
+    f.args,
+  );
+
+  // Share is of turns that named ANY airport, not of all turns: most turns name none, and dividing
+  // by the whole window would make every airport look negligible.
+  const withAirport = await query(
+    `SELECT COUNT(DISTINCT e.turn_id) AS n
+     FROM turn_entity e
+     JOIN turn t ON t.turn_id = e.turn_id
+     JOIN session s ON s.session_id = t.session_id
+     WHERE ${f.sql} AND e.entity_type = 'airport'`,
+    f.args,
+  );
+  const denominator = num(withAirport[0]?.n);
+
+  return {
+    ...envelope("one airport", r, counted.total, counted.seeded, {
+      extra:
+        denominator === 0
+          ? []
+          : [
+              `Shares are of the ${denominator} turns that named an airport, not of all ` +
+                `${counted.total} turns in the window — most questions name none.`,
+            ],
+    }),
+    data: rows.map((row) => ({
+      code: String(row.code),
+      label: row.label === null ? null : String(row.label),
+      turns: num(row.turns),
+      share: denominator === 0 ? 0 : num(row.turns) / denominator,
+      promptTurns: num(row.prompt_turns),
+      toolTurns: num(row.tool_turns),
+    })),
+  };
+}
+
+export interface PhrasingRow {
+  phrase: string;
+  turns: number;
+}
+
+/**
+ * What people type when they do not type a code.
+ *
+ * "LA" is the standing example: it is neither an IATA code nor a city in the dataset, and it is
+ * what users actually write. Resolution is exactly what destroys this fact, so it is captured
+ * before resolution — a resolved-code column can never answer "how do people refer to this place".
+ */
+export async function unresolvedPhrasings(
+  q: AnalyticsQuery = {},
+  sample?: Sample,
+): Promise<Analytics<PhrasingRow[]>> {
+  const r = resolve(q);
+  const f = turnFilter(r);
+  const counted = sample ?? (await sampleOf(r));
+
+  const rows = await query(
+    `SELECT e.code, COUNT(DISTINCT e.turn_id) AS turns
+     FROM turn_entity e
+     JOIN turn t ON t.turn_id = e.turn_id
+     JOIN session s ON s.session_id = t.session_id
+     WHERE ${f.sql} AND e.entity_type = 'unresolved'
+     GROUP BY e.code ORDER BY turns DESC, e.code LIMIT 20`,
+    f.args,
+  );
+
+  return {
+    ...envelope("one phrasing", r, counted.total, counted.seeded),
+    data: rows.map((row) => ({ phrase: String(row.code), turns: num(row.turns) })),
+  };
+}
+
+/**
+ * Airports asked about that the dataset does not cover.
+ *
+ * A demand signal rather than a bug list: the agent was given a code and had no data for it.
+ * Recorded only when it arrived through a tool argument, because there the agent asserted it was
+ * an airport — a three-letter token in free prose could be "ROI" or "CEO".
+ */
+export async function coverageGaps(
+  q: AnalyticsQuery = {},
+  sample?: Sample,
+): Promise<Analytics<PhrasingRow[]>> {
+  const r = resolve(q);
+  const f = turnFilter(r);
+  const counted = sample ?? (await sampleOf(r));
+
+  const rows = await query(
+    `SELECT e.code, COUNT(DISTINCT e.turn_id) AS turns
+     FROM turn_entity e
+     JOIN turn t ON t.turn_id = e.turn_id
+     JOIN session s ON s.session_id = t.session_id
+     WHERE ${f.sql} AND e.entity_type = 'unknown_code'
+     GROUP BY e.code ORDER BY turns DESC, e.code LIMIT 20`,
+    f.args,
+  );
+
+  return {
+    ...envelope("one unrecognised code", r, counted.total, counted.seeded),
+    data: rows.map((row) => ({ phrase: String(row.code), turns: num(row.turns) })),
+  };
+}

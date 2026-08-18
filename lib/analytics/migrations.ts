@@ -113,6 +113,31 @@ export const MIGRATIONS: readonly Migration[] = [
          ON turn_topic (classifier_version, topic_id)`,
     ],
   },
+  {
+    version: 2,
+    name: "airport entities per turn",
+    up: [
+      // grain: one entity, mentioned in one turn, from one source
+      //
+      // A second dimension alongside the topic label. Topics say what KIND of question was asked;
+      // this says what it was ABOUT, which is orthogonal and cannot be folded into the taxonomy
+      // without inventing a class per airport.
+      //
+      // `source` is part of the grain rather than a mere attribute: an airport the user typed and
+      // an airport the agent resolved to are different facts, and keeping them apart is what lets
+      // the dashboard show how often the agent reached somewhere nobody named.
+      `CREATE TABLE IF NOT EXISTS turn_entity (
+         turn_id     TEXT NOT NULL REFERENCES turn(turn_id) ON DELETE CASCADE,
+         entity_type TEXT NOT NULL CHECK (entity_type IN ('airport','unresolved','unknown_code')),
+         code        TEXT NOT NULL,
+         source      TEXT NOT NULL CHECK (source IN ('tool_arg','prompt')),
+         label       TEXT,
+         PRIMARY KEY (turn_id, entity_type, code, source)
+       )`,
+      `CREATE INDEX IF NOT EXISTS turn_entity_code_idx
+         ON turn_entity (entity_type, code)`,
+    ],
+  },
 ];
 
 /** The version a fully-migrated database sits at. */

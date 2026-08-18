@@ -27,8 +27,13 @@ export type TurnOutcome = "answered" | "truncated" | "error";
  *
  * A message is prose that changes when someone rewords it; a category is a dimension you can group
  * by six months later and still get the same buckets.
+ *
+ * `cancelled` is the odd one out: the user closed the tab or navigated away, which is not a failure
+ * of the agent at all. It is carried here rather than as a fourth `TurnOutcome` because `outcome`
+ * has a CHECK constraint and widening it means rebuilding a table with two cascading children —
+ * more risk than the distinction is worth today. The reliability aggregates exclude it explicitly.
  */
-export type ErrorKind = "rate_limit" | "auth" | "upstream" | "unexpected";
+export type ErrorKind = "rate_limit" | "auth" | "upstream" | "unexpected" | "cancelled";
 
 /** Which stage of the classifier decided a label. `abstain` is a real outcome, not a failure. */
 export type ClassifierStage = "rule" | "llm" | "abstain";

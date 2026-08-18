@@ -54,7 +54,10 @@ export function costUsd(
   promptTokens: number | null,
   completionTokens: number | null,
 ): number | null {
-  const price = MODEL_PRICES[model];
+  // `MODEL_PRICES[model]` alone resolves inherited keys: "constructor" and "toString" are truthy
+  // and have no rate fields, so the arithmetic below returns NaN for a model that was never priced.
+  // NaN then propagates into SUM and AVG as a real-looking figure. `null` is the honest answer.
+  const price = Object.hasOwn(MODEL_PRICES, model) ? MODEL_PRICES[model] : undefined;
   if (!price) return null;
   if (promptTokens === null && completionTokens === null) return null;
 
@@ -64,7 +67,8 @@ export function costUsd(
 }
 
 export function isPriced(model: string): boolean {
-  return model in MODEL_PRICES;
+  // `in` walks the prototype chain, so `isPriced("toString")` was true. Own keys only.
+  return Object.hasOwn(MODEL_PRICES, model);
 }
 
 /**

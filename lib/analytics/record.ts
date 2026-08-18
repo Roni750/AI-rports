@@ -1,5 +1,7 @@
 import { classifyByRules } from "./classify-rules";
 import { ACTIVE_CLASSIFIER_VERSION } from "./classifier-version";
+import { loadAirportLookup } from "../data/db";
+import { extractEntities } from "./entities";
 import { costUsd } from "./pricing";
 import { redact, redactArguments } from "./redact";
 import { write } from "./store";
@@ -45,6 +47,16 @@ async function writeTurn(input: TurnRecord): Promise<void> {
   // It costs nothing measurable and means the dashboard has labels the instant a turn lands. Turns
   // it declines to label are written as abstentions for the batch LLM pass to pick up, so an
   // unlabelled turn is a queue entry rather than a gap.
+  // Which airports the turn was about. Also pure, also inline, and reading the REDACTED prompt —
+  // the same text that gets stored, so nothing can be recognised here that was scrubbed there.
+  const entities = extractEntities(
+    {
+      prompt: redacted.text,
+      toolCalls: input.toolTrace.map((t) => ({ name: t.name, arguments: t.arguments })),
+    },
+    loadAirportLookup(),
+  );
+
   const labelled = classifyByRules({
     prompt: redacted.text,
     toolsInvoked: input.toolTrace.map((t) => t.name),
@@ -112,6 +124,24 @@ async function writeTurn(input: TurnRecord): Promise<void> {
         redacted.version,
       ],
     },
+    // After the turn insert: the foreign key needs its parent row, and `PRAGMA foreign_keys = ON`
+    // is active.
+    //
+    // Delete-then-insert rather than OR REPLACE, so this turn's entities are exactly what the
+    // current extractor produces. OR REPLACE refreshes rows the extractor still emits but cannot
+    // retract ones it no longer does, which leaves a re-recorded turn carrying labels from an
+    // older version of the rules. The whole batch is atomic, so there is no window where a turn
+    // has no entities.
+    {
+      sql: "DELETE FROM turn_entity WHERE turn_id = ?",
+      args: [id],
+    },
+    ...entities.map((entity) => ({
+      sql: `INSERT INTO turn_entity
+              (turn_id, entity_type, code, source, label)
+            VALUES (?, ?, ?, ?, ?)`,
+      args: [id, entity.entityType, entity.code, entity.source, entity.label],
+    })),
     ...input.toolTrace.map((call, index) => ({
       // OR REPLACE against the (turn_id, call_index) primary key, so re-recording a turn rewrites
       // its tool calls rather than appending a second copy of them.

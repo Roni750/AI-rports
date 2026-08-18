@@ -13,8 +13,10 @@ import {
   YAxis,
 } from "recharts";
 
+import { EmptyChart, SERIES, axisStyle, tooltipProps } from "../chart-theme";
+
 /**
- * Every chart on the dashboard, and the only file in the app that imports Recharts.
+ * Every chart on the dashboard, and the only file on THIS route that imports Recharts.
  *
  * THE BOUNDARY IS THE POINT. Recharts is client-only, so importing it anywhere in the page tree
  * would force `"use client"` upward and break the thing that makes `page.tsx` simple: it reads the
@@ -22,33 +24,10 @@ import {
  * Confining the library to one leaf keeps that property. Panels, tiles and tables above this file
  * stay server components and receive plain serialisable props.
  *
- * Colours come from the `--chart-N` custom properties in `globals.css`, so light and dark are
- * handled by the same mechanism as the rest of the app rather than by a second theme system living
- * inside a charting library's config.
+ * The chat has its own leaf, `app/chat-charts.tsx`, under the same rule. Chrome common to both —
+ * the series order, axis and tooltip styling, the empty state — lives in `app/chart-theme.tsx` so
+ * the two surfaces cannot drift into separate visual systems.
  */
-
-const SERIES = [
-  "var(--chart-1)",
-  "var(--chart-2)",
-  "var(--chart-3)",
-  "var(--chart-4)",
-  "var(--chart-5)",
-  "var(--chart-6)",
-];
-
-const axisStyle = { fontSize: 11, fill: "currentColor", opacity: 0.6 };
-
-/** Shared tooltip chrome, so all three charts read as one component rather than three defaults. */
-const tooltipProps = {
-  contentStyle: {
-    background: "var(--background)",
-    border: "1px solid var(--chart-grid)",
-    borderRadius: "0.5rem",
-    fontSize: "0.75rem",
-    color: "var(--foreground)",
-  },
-  cursor: { fill: "currentColor", opacity: 0.05 },
-} as const;
 
 export interface TopicBar {
   label: string;
@@ -173,16 +152,56 @@ export function ToolBars({ data }: { data: ToolBar[] }) {
   );
 }
 
+export interface AirportBar {
+  code: string;
+  label: string | null;
+  turns: number;
+  promptTurns: number;
+  toolTurns: number;
+}
+
 /**
- * The empty state is a component, not a blank box.
+ * Which airports people ask about.
  *
- * An empty chart and a broken chart look identical otherwise, and the difference matters most
- * exactly when someone is looking at a dashboard to find out what went wrong.
+ * ONE BAR PER AIRPORT, showing distinct turns — deliberately not a stack of "named by the user"
+ * and "resolved by the agent". Those two overlap: naming ANC in the prompt and passing it to a
+ * tool is one turn with both counts set, and being both is the normal case, so stacking them
+ * would inflate nearly every bar to roughly double its true height. The split is real and worth
+ * seeing, so it lives in the table below where the overlap can be stated rather than drawn.
  */
-function EmptyChart({ note }: { note: string }) {
+export function AirportBars({ data }: { data: AirportBar[] }) {
+  const rows = data.slice(0, 12);
+  if (rows.length === 0) return <EmptyChart note="No airports named in this window." />;
+
   return (
-    <div className="flex h-24 items-center justify-center rounded-lg border border-dashed border-current/15 text-xs opacity-50">
-      {note}
-    </div>
+    <ResponsiveContainer width="100%" height={Math.max(180, rows.length * 30)}>
+      <BarChart data={rows} layout="vertical" margin={{ left: 8, right: 16, top: 4, bottom: 4 }}>
+        <CartesianGrid horizontal={false} stroke="var(--chart-grid)" />
+        <XAxis type="number" tick={axisStyle} stroke="var(--chart-grid)" allowDecimals={false} />
+        <YAxis
+          type="category"
+          dataKey="code"
+          width={56}
+          tick={axisStyle}
+          stroke="var(--chart-grid)"
+        />
+        <Tooltip
+          {...tooltipProps}
+          formatter={(value, _name, entry) => {
+            const row = entry?.payload as AirportBar | undefined;
+            return [
+              `${Number(value)} turns — named by the user in ${row?.promptTurns ?? 0}, ` +
+                `resolved by the agent in ${row?.toolTurns ?? 0}`,
+              "asked about",
+            ];
+          }}
+          labelFormatter={(code) => {
+            const row = rows.find((r) => r.code === code);
+            return row?.label ? `${code} — ${row.label}` : String(code);
+          }}
+        />
+        <Bar dataKey="turns" fill={SERIES[0]} radius={[0, 4, 4, 0]} />
+      </BarChart>
+    </ResponsiveContainer>
   );
 }

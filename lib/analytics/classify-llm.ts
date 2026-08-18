@@ -29,6 +29,16 @@ export interface LlmClassification {
   stage: "llm" | "abstain";
   reason: string | null;
   costUsd: number | null;
+  /**
+   * True when the call never produced a judgement — no key, a 429, a transport error.
+   *
+   * An abstention and a failed request are both `stage: "abstain"`, and conflating them was
+   * expensive in both directions. Persisted, a rate-limited batch writes permanent abstentions for
+   * turns the model never actually saw; and because the batch selector re-reads abstentions, every
+   * later run pays for them again. A retryable result is meant to be dropped rather than stored:
+   * the turn stays unlabelled and the next run picks it up.
+   */
+  retryable: boolean;
 }
 
 /** Built once. The definitions are the contract the gold set is also labelled against. */
@@ -58,6 +68,10 @@ Rules:
  * Never throws: a classifier failure must not abort a batch that has already spent real tokens on
  * earlier items. Failures come back as abstentions, which is the same state a low-confidence
  * answer produces, and which the review queue already surfaces.
+ *
+ * They are marked `retryable`, though, and the distinction matters to the caller. A model that
+ * looked at a prompt and declined it is a finding worth storing; a request that never reached the
+ * model is not, and storing it as an abstention makes the turn look permanently unclassifiable.
  */
 export async function classifyWithModel(
   prompt: string,
@@ -65,16 +79,64 @@ export async function classifyWithModel(
   apiKey = process.env.GROQ_API_KEY ?? "",
 ): Promise<LlmClassification> {
   if (!apiKey) {
-    return abstain("no GROQ_API_KEY configured");
+    return failed("no GROQ_API_KEY configured");
   }
 
   const user =
     `Question: ${prompt}\n` +
     `Tools the assistant ran: ${toolsInvoked.length > 0 ? toolsInvoked.join(", ") : "none"}`;
 
+  for (let attempt = 0; ; attempt++) {
+    const outcome = await attemptOnce(user, apiKey);
+    // A 429 is the one failure worth waiting out in place: the token window resets in tens of
+    // seconds, and giving up leaves the turn to be re-selected and re-paid for on a later run.
+    if (outcome.rateLimited && attempt < MAX_RETRIES) {
+      await sleep(backoffMs(outcome.retryAfterSeconds, attempt));
+      continue;
+    }
+    return outcome.classification;
+  }
+}
+
+/** Bounded: a batch that stalls forever against a throttled key is worse than a short run. */
+const MAX_RETRIES = 3;
+
+/**
+ * How long one classification may take before it is abandoned.
+ *
+ * Node's `fetch` has no default timeout. A connection that opens and never responds would hang the
+ * whole batch with no diagnostic — the run just stops printing, having already spent tokens on
+ * every item before it.
+ */
+const REQUEST_TIMEOUT_MS = 30_000;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Honour the provider's own reset hint when it sends one, but never wait less than the backoff. */
+function backoffMs(retryAfterSeconds: number | null, attempt: number): number {
+  const backoff = Math.min(2 ** attempt * 1000, 8000);
+  const hinted = retryAfterSeconds === null ? 0 : retryAfterSeconds * 1000;
+  return Math.min(Math.max(hinted, backoff), 30_000);
+}
+
+interface Attempt {
+  classification: LlmClassification;
+  rateLimited: boolean;
+  retryAfterSeconds: number | null;
+}
+
+/** One request. Separated from the retry loop so the loop has nothing to do but decide to wait. */
+async function attemptOnce(user: string, apiKey: string): Promise<Attempt> {
+  const settled = (classification: LlmClassification): Attempt => ({
+    classification,
+    rateLimited: false,
+    retryAfterSeconds: null,
+  });
+
   try {
     const res = await fetch(GROQ_URL, {
       method: "POST",
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
         model: CLASSIFIER_MODEL,
@@ -92,7 +154,14 @@ export async function classifyWithModel(
     });
 
     if (!res.ok) {
-      return abstain(`provider returned ${res.status}`);
+      // The provider decided nothing here, so this is not an abstention to record. Surface a 429
+      // separately: it is the one status the retry loop above can actually do something about.
+      const hint = Number(res.headers.get("retry-after") ?? res.headers.get("x-ratelimit-reset-tokens"));
+      return {
+        classification: failed(`provider returned ${res.status}`),
+        rateLimited: res.status === 429,
+        retryAfterSeconds: Number.isFinite(hint) ? hint : null,
+      };
     }
 
     const json = (await res.json()) as {
@@ -101,7 +170,8 @@ export async function classifyWithModel(
     };
 
     const content = json.choices?.[0]?.message?.content;
-    if (!content) return abstain("empty response");
+    // A 200 with no content is a provider defect, not a judgement about the prompt.
+    if (!content) return settled(failed("empty response"));
 
     const cost = costUsd(
       CLASSIFIER_MODEL,
@@ -113,7 +183,7 @@ export async function classifyWithModel(
     try {
       parsed = JSON.parse(content);
     } catch {
-      return abstain("response was not valid JSON", cost);
+      return settled(abstain("response was not valid JSON", cost));
     }
 
     const topicId = typeof parsed.topic_id === "string" ? parsed.topic_id : "";
@@ -121,7 +191,7 @@ export async function classifyWithModel(
     // declared taxonomy is discarded rather than stored, or the foreign key would reject it later
     // and take the whole batch with it.
     if (!isTopicId(topicId) || !CLASSIFIABLE_TOPIC_IDS.includes(topicId)) {
-      return abstain(`returned unknown topic "${String(parsed.topic_id).slice(0, 40)}"`, cost);
+      return settled(abstain(`returned unknown topic "${String(parsed.topic_id).slice(0, 40)}"`, cost));
     }
 
     const confidence =
@@ -131,21 +201,46 @@ export async function classifyWithModel(
     const reason = typeof parsed.reason === "string" ? parsed.reason.slice(0, 120) : null;
 
     if (confidence < MIN_CONFIDENCE) {
-      return {
+      // A real abstention: the model answered and was not sure enough. Worth storing, and worth
+      // NOT asking again — the same prompt and the same model will reach the same place.
+      return settled({
         topicId: UNCLASSIFIED,
         confidence,
         stage: "abstain",
         reason: reason ?? "below confidence threshold",
         costUsd: cost,
-      };
+        retryable: false,
+      });
     }
 
-    return { topicId, confidence, stage: "llm", reason, costUsd: cost };
+    return settled({ topicId, confidence, stage: "llm", reason, costUsd: cost, retryable: false });
   } catch (err) {
-    return abstain(err instanceof Error ? err.message.slice(0, 80) : "request failed");
+    // Includes the timeout above, which arrives as an AbortError. Nothing was learned, so nothing
+    // is recorded.
+    return settled(failed(err instanceof Error ? err.message.slice(0, 80) : "request failed"));
   }
 }
 
+/** The model looked and declined. A result, and one the review queue is built to surface. */
 function abstain(reason: string, cost: number | null = null): LlmClassification {
-  return { topicId: UNCLASSIFIED, confidence: 0, stage: "abstain", reason, costUsd: cost };
+  return {
+    topicId: UNCLASSIFIED,
+    confidence: 0,
+    stage: "abstain",
+    reason,
+    costUsd: cost,
+    retryable: false,
+  };
+}
+
+/** The call did not happen. Shaped like an abstention so nothing downstream has to branch on it. */
+function failed(reason: string): LlmClassification {
+  return {
+    topicId: UNCLASSIFIED,
+    confidence: 0,
+    stage: "abstain",
+    reason,
+    costUsd: null,
+    retryable: true,
+  };
 }
