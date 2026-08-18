@@ -131,10 +131,10 @@ The four measurements are in incompatible units:
 load factor        83.2  percent
 NAS delay           7.98 minutes
 growth             −2.0  percent
-upgauging           6.38 percentage points
+upgauging           6.27 percentage points
 ```
 
-`83.2 + 7.98 + (−2.0) + 6.38` is meaningless arithmetic. Percent and minutes don't add.
+`83.2 + 7.98 + (−2.0) + 6.27` is meaningless arithmetic. Percent and minutes don't add.
 
 ---
 
@@ -161,8 +161,8 @@ passengers:
 | Cohort | Share of national passengers | Count in our data |
 |---|---|---|
 | Large hub | ≥ 1% | 31 |
-| Medium hub | 0.25% – 1% | 35 |
-| Small hub | 0.05% – 0.25% | 74 |
+| Medium hub | 0.25% – 1% | 34 |
+| Small hub | 0.05% – 0.25% | 75 |
 
 **Proof this was necessary:** without cohorts, Harrisburg's 86.8% load factor beats Atlanta's 84.7%,
 and Harrisburg becomes the top terminal-expansion candidate in America. That is obviously wrong, and
@@ -189,7 +189,7 @@ it sounds. Across the 31 large hubs (CV = spread relative to the mean):
 | Load factor | 1.8 | 81.0 | 82.3 | 83.2 | **2%** |
 | NAS delay | 1.5 | 2.0 | 2.9 | 4.0 | 48% |
 | Passenger growth | 5.3 | 0.6 | 4.7 | 9.2 | 109% |
-| Upgauging | 4.9 | 6.0 | 12.8 | 12.8 | 55% |
+| Upgauging | 4.9 | 6.0 | 8.9 | 12.8 | 55% |
 
 **Load factor barely separates airports at all** — every large hub sits between 81% and 83.2% at
 the quartiles, precisely because airlines all manage to the same target. Upgauging discriminates
@@ -260,11 +260,14 @@ penalised for a gap in **our data** rather than for anything about the airport.
 
 | Component | Raw value | Percentile (of 31 large hubs) | Weight | Contribution |
 |---|---|---|---|---|
-| Demand pressure | 83.2% load factor | 79.0 | 0.35 | **27.7** |
+| Demand pressure | 83.2% load factor | 79.0 | 0.30 | **23.7** |
 | Capacity strain | 7.98 NAS min/arrival | **98.4** | 0.25 | **24.6** |
 | Growth momentum | −2.0% | **11.3** | 0.25 | **2.8** |
-| Frequency constraint | +6.38 pts | 30.6 | 0.15 | **4.6** |
-| | | | | **59.7** |
+| Frequency constraint | +6.27 pts | 30.6 | 0.20 | **6.1** |
+| | | | | **57.3** |
+
+*(Contributions are rounded to one decimal, so the column reads 57.2; the score is computed from
+full-precision percentiles and is 57.26. Verify with `npm run data:smoke`.)*
 
 **How to read this — and the total is the least interesting part.**
 

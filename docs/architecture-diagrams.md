@@ -20,7 +20,7 @@ flowchart TB
 
     subgraph server["Next.js server — Node runtime"]
         API["POST /api/chat<br/><i>request validation</i>"]
-        AGENT["Agent loop<br/><i>max 6 iterations</i>"]
+        AGENT["Agent loop<br/><i>max 3 iterations</i>"]
         DISPATCH["Tool dispatcher<br/><i>validates every parameter</i>"]
 
         subgraph tools["Tool surface — 6 typed tools"]
@@ -137,7 +137,7 @@ flowchart TB
         R1["Load factor<br/><i>83.2 percent</i>"]
         R2["NAS delay<br/><i>7.98 minutes/arrival</i>"]
         R3["Passenger growth<br/><i>−2.0 percent</i>"]
-        R4["Seat growth − departure growth<br/><i>6.38 points</i>"]
+        R4["Seat growth − departure growth<br/><i>6.27 points</i>"]
     end
 
     COHORT{"Assign size cohort<br/><i>share of national passengers</i>"}

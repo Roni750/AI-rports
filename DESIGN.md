@@ -4,7 +4,8 @@ An AI agent that helps analysts identify US airports where expansion is most war
 aviation data from the Bureau of Transportation Statistics.
 
 **Diagrams:** [`docs/architecture-diagrams.md`](docs/architecture-diagrams.md) — system overview,
-data pipeline, scoring flow, agent loop, ambiguity handling, and scope boundary.
+data pipeline, scoring flow, agent loop, required context, ambiguity handling, conversation
+analytics, and scope boundary.
 **Deeper reading:** [`docs/scoring-methodology.md`](docs/scoring-methodology.md) explains the model
 from first principles; [`docs/data-architecture.md`](docs/data-architecture.md) covers ingestion,
 entity modelling, and how missing sources would be added.
@@ -50,7 +51,7 @@ combined as a weighted sum on a 0–100 scale.
 ### Why percentiles rather than raw values
 
 The four measurements are in incompatible units — percent, minutes, percentage points. Adding
-`83.2 + 7.98 + (−2.0) + 6.38` is meaningless arithmetic. Percentile ranking puts them on one scale.
+`83.2 + 7.98 + (−2.0) + 6.27` is meaningless arithmetic. Percentile ranking puts them on one scale.
 
 It also bounds outliers. New Haven grew passengers ~510% between 2019 and 2024 because one carrier
 opened a base there. Under raw values or z-scores that single number dominates any growth-weighted
@@ -137,7 +138,7 @@ other classes, so summing across classes naively would double-count while still 
 The build asserts they are absent.
 
 ### A bounded agent loop rather than an autonomous one
-Six iterations maximum, a fixed tool set, every parameter validated. **Cost:** it cannot improvise
+Three iterations maximum, a fixed tool set, every parameter validated. **Cost:** it cannot improvise
 beyond its tools. **Benefit:** predictable, debuggable, and cheap. For an investment tool,
 predictability beats autonomy.
 
