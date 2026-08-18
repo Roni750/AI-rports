@@ -129,6 +129,23 @@ export interface AgentTiming {
 	rateLimitRetries: number;
 }
 
+/**
+ * Tokens consumed across every model call in one answer.
+ *
+ * Deliberately raw counts and no dollar figure. Converting to money needs a price table, and a
+ * price is a fact about a vendor's website rather than about this loop — so it lives in
+ * `lib/analytics/pricing.ts` and is applied at the boundary. That keeps the agent free of any
+ * dependency on the analytics layer, and keeps one place to fix when a rate changes.
+ *
+ * Null means the provider did not report usage, which is different from zero.
+ */
+export interface AgentUsage {
+	promptTokens: number | null;
+	completionTokens: number | null;
+	/** Model calls that reported no usage block, so a null total can be explained rather than hidden. */
+	callsMissingUsage: number;
+}
+
 export interface AgentResult {
 	reply: string;
 	trace: ToolTraceEntry[];
@@ -137,6 +154,7 @@ export interface AgentResult {
 	/** Set when the loop hit its iteration cap without the model producing a final answer. */
 	truncated: boolean;
 	timing: AgentTiming;
+	usage: AgentUsage;
 }
 
 interface ApiToolCall {
@@ -168,6 +186,9 @@ export class AgentError extends Error {
 export interface CallStats {
 	requestChars: number;
 	rateLimitRetries: number;
+	/** From the provider's own `usage` block. Null when it omitted one — never inferred. */
+	promptTokens: number | null;
+	completionTokens: number | null;
 }
 
 async function callModel(
@@ -202,9 +223,18 @@ async function callModel(
 		});
 
 		if (res.ok) {
-			const json = (await res.json()) as { choices?: { message?: ApiMessage }[] };
+			const json = (await res.json()) as {
+				choices?: { message?: ApiMessage }[];
+				usage?: { prompt_tokens?: number; completion_tokens?: number };
+			};
 			const message = json.choices?.[0]?.message;
 			if (!message) throw new AgentError("Groq returned no message.", 502);
+			if (stats) {
+				// Token counts ride along on every response and used to be parsed and dropped. They
+				// are the only non-estimated basis for a cost figure, so they are worth the two lines.
+				stats.promptTokens = json.usage?.prompt_tokens ?? null;
+				stats.completionTokens = json.usage?.completion_tokens ?? null;
+			}
 			return message;
 		}
 
@@ -288,6 +318,9 @@ export async function runAgent(
 	const modelMs: number[] = [];
 	const requestChars: number[] = [];
 	let rateLimitRetries = 0;
+	let promptTokens: number | null = null;
+	let completionTokens: number | null = null;
+	let callsMissingUsage = 0;
 
 	// The fixed prefix re-sent on every single call, measured once rather than estimated.
 	const prefixChars = JSON.stringify({
@@ -306,13 +339,20 @@ export async function runAgent(
 		rateLimitRetries,
 	});
 
+	const usage = (): AgentUsage => ({promptTokens, completionTokens, callsMissingUsage});
+
 	/** Wraps every model call so no timing path can be forgotten. */
 	const timedCall = async (
 		msgs: ApiMessage[],
 		withTools = true,
 	): Promise<ApiMessage> => {
 		const t0 = Date.now();
-		const stats: CallStats = {requestChars: 0, rateLimitRetries: 0};
+		const stats: CallStats = {
+			requestChars: 0,
+			rateLimitRetries: 0,
+			promptTokens: null,
+			completionTokens: null,
+		};
 		try {
 			return await callModel(msgs, apiKey, model, signal, withTools, stats);
 		} finally {
@@ -320,6 +360,16 @@ export async function runAgent(
 			modelMs.push(Date.now() - t0);
 			requestChars.push(stats.requestChars);
 			rateLimitRetries += stats.rateLimitRetries;
+
+			// Summed across calls, but a missing report must not silently read as zero: totals stay
+			// null until at least one call reports, and every gap is counted so the total can be
+			// labelled partial rather than quietly understating spend.
+			if (stats.promptTokens === null && stats.completionTokens === null) {
+				callsMissingUsage++;
+			} else {
+				promptTokens = (promptTokens ?? 0) + (stats.promptTokens ?? 0);
+				completionTokens = (completionTokens ?? 0) + (stats.completionTokens ?? 0);
+			}
 		}
 	};
 
@@ -336,6 +386,7 @@ export async function runAgent(
 				model,
 				truncated: false,
 				timing: timing(),
+				usage: usage(),
 			};
 		}
 
@@ -395,5 +446,6 @@ export async function runAgent(
 		model,
 		truncated: true,
 		timing: timing(),
+		usage: usage(),
 	};
 }
