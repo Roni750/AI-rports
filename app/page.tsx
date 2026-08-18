@@ -1,8 +1,11 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+
+import { costUsd, formatUsd } from "../lib/analytics/pricing";
 
 /**
  * Chat interface for the airport investment agent.
@@ -26,6 +29,48 @@ interface Turn {
   trace?: ToolTraceEntry[];
   model?: string;
   truncated?: boolean;
+  usage?: { promptTokens: number | null; completionTokens: number | null };
+  timing?: { totalMs: number };
+}
+
+/**
+ * The conversation's analytics id.
+ *
+ * Held in `sessionStorage`, which is scoped to a single tab — exactly the boundary of one
+ * conversation. A cookie would work too, and would also make this a stateful endpoint and raise a
+ * consent question that a screening demo has no need to answer.
+ *
+ * Minted lazily inside the send handler rather than in a `useState` initialiser: the initialiser
+ * runs during server rendering, where `sessionStorage` and `crypto.randomUUID` are unavailable and
+ * a generated value would differ between server and client, producing a hydration mismatch.
+ */
+function sessionId(): string {
+  const existing = sessionStorage.getItem("aii.session");
+  if (existing) return existing;
+  const fresh = crypto.randomUUID();
+  sessionStorage.setItem("aii.session", fresh);
+  return fresh;
+}
+
+/**
+ * The tokens/cost/latency suffix for the trace footer.
+ *
+ * Returns nothing rather than a placeholder when the numbers are unavailable — a turn whose
+ * provider omitted usage should say less, not guess.
+ */
+function describeCost(turn: Turn): string {
+  const parts: string[] = [];
+  const tokens = (turn.usage?.promptTokens ?? 0) + (turn.usage?.completionTokens ?? 0);
+  if (tokens > 0) parts.push(`${tokens.toLocaleString()} tokens`);
+
+  const cost = turn.model
+    ? costUsd(turn.model, turn.usage?.promptTokens ?? null, turn.usage?.completionTokens ?? null)
+    : null;
+  if (cost !== null) parts.push(formatUsd(cost));
+
+  if (turn.timing) parts.push(`${(turn.timing.totalMs / 1000).toFixed(1)}s`);
+
+  return parts.length > 0 ? ` · ${parts.join(" · ")}` : "";
 }
 
 /** The brief's four questions, each of which exercises a different capability. */
@@ -64,6 +109,7 @@ export default function Page() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           messages: nextTurns.map((t) => ({ role: t.role, content: t.content })),
+          sessionId: sessionId(),
         }),
       });
       const data = await res.json();
@@ -81,6 +127,8 @@ export default function Page() {
           trace: data.trace,
           model: data.model,
           truncated: data.truncated,
+          usage: data.usage,
+          timing: data.timing,
         },
       ]);
     } catch (err) {
@@ -96,7 +144,15 @@ export default function Page() {
   return (
     <main className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-4 px-4 py-6">
       <header className="border-b border-current/10 pb-4">
-        <h1 className="text-lg font-semibold">Airport Investment Intelligence</h1>
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <h1 className="text-lg font-semibold">Airport Investment Intelligence</h1>
+          <Link
+            href="/analytics"
+            className="text-sm underline decoration-dotted opacity-70 hover:opacity-100"
+          >
+            Analytics →
+          </Link>
+        </div>
         <p className="mt-1 text-sm opacity-70">
           Screens US airports for expansion opportunity using BTS traffic and delay data
           (2019, 2023, 2024). Measures demand-side opportunity, not profitability.
@@ -167,8 +223,15 @@ export default function Page() {
                       ))}
                       {turn.model && (
                         <li className="mt-1 border-t border-current/10 pt-1 opacity-50">
-                          model: {turn.model} — every figure above came from these calls, not from
-                          the model
+                          model: {turn.model}
+                          {/*
+                            Cost belongs next to the trace, not only on the analytics page. A
+                            number you have to navigate to is a number nobody looks at, and "what
+                            does one answer cost" is the question this whole layer exists to make
+                            answerable.
+                          */}
+                          {describeCost(turn)}
+                          {" "}— every figure above came from these calls, not from the model
                         </li>
                       )}
                     </ul>

@@ -3,11 +3,37 @@
 :root {
   --background: #ffffff;
   --foreground: #171717;
+
+  /*
+   * Chart palette.
+   *
+   * The app otherwise styles everything with alpha-of-currentColor, which adapts to light and dark
+   * for free. Charts cannot: a stacked bar or a multi-series legend needs categorically distinct
+   * hues, and opacity alone does not distinguish ten topics.
+   *
+   * So this is the one place named colours are declared, as an ordered scale rather than
+   * per-meaning names — chart-1 is simply "the first series", which keeps the palette reusable and
+   * stops it accumulating a colour per concept. Muted on purpose, to sit beside the existing
+   * greyscale chrome rather than shout over it.
+   */
+  --chart-1: #3b6ea5;
+  --chart-2: #4f9d76;
+  --chart-3: #c08a3e;
+  --chart-4: #9a5f9e;
+  --chart-5: #4d8f9c;
+  --chart-6: #b0603f;
+  --chart-grid: rgb(0 0 0 / 0.1);
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-chart-6: var(--chart-6);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
@@ -16,6 +42,15 @@
   :root {
     --background: #0a0a0a;
     --foreground: #ededed;
+
+    /* Lifted for contrast against the dark ground; same hues, same order. */
+    --chart-1: #6fa8dc;
+    --chart-2: #7bc4a0;
+    --chart-3: #e0b070;
+    --chart-4: #c08fc4;
+    --chart-5: #79b9c6;
+    --chart-6: #d98f6e;
+    --chart-grid: rgb(255 255 255 / 0.12);
   }
 }
 
