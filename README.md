@@ -92,10 +92,11 @@ npm run data:build       # -> data/aviation.db
 ## Verification
 
 ```bash
-npm run verify             # typecheck + 56 tests
+npm run verify             # typecheck + 150 tests, incl. classifier accuracy floors
 npm run data:smoke         # scoring engine against real data
 npm run data:verify-tools  # the brief's four questions, end to end
 npm run models             # list models the configured API key can use
+npm run eval:topics        # topic classifier P/R/F1 + confusion matrix (no network)
 ```
 
 ---
@@ -107,13 +108,33 @@ lib/scoring/      deterministic scoring engine — percentiles, cohorts, robustn
 lib/tools/        six typed tools; assumptions travel as data, not prose
 lib/agent/        bounded tool-calling loop, tool schemas, system prompt
 lib/data/         read-only SQLite access (the only file that knows the storage format)
+lib/analytics/    conversation analytics — store, taxonomy, classifier, queries, eval
 app/api/chat/     chat endpoint (Node runtime — node:sqlite is unavailable on Edge)
 app/page.tsx      chat UI with the tool trace panel
+app/analytics/    the analytics dashboard (server components; Recharts confined to charts.tsx)
 scripts/          Python data pipeline + TypeScript verification scripts
 docs/             design documentation
 ```
 
+## Conversation analytics
+
+`/analytics` reports what people ask, what each answer costs, and where the system degrades. Every
+turn is persisted with its tool trace, tokens, cost and latency, and every prompt is grouped under
+one of ten umbrella topics by a two-stage classifier — deterministic rules first, a model only on
+what they decline. On the labelled gold set the rule stage resolves **98.4% of prompts at $0**.
+
+Accuracy is measured rather than asserted: `npm run eval:topics` prints per-class precision, recall
+and F1 plus a confusion matrix, and `npm run verify` enforces floors so a regression fails the build
+without needing a network or an API key. See DESIGN.md §6 for what that score does and does not mean.
+
+```bash
+npm run analytics:migrate   # idempotent
+npm run analytics:seed      # replay a corpus through the real agent (~7 min) so the demo has data
+npm run analytics:classify  # label anything the inline rule stage declined
+```
+
 ## Stack
 
-Next.js 16 · React 19 · TypeScript · Tailwind 4 · `node:sqlite` (no native module) ·
-Groq for inference · Python + pandas for offline data preparation only
+Next.js 16 · React 19 · TypeScript · Tailwind 4 · `node:sqlite` (read-only dataset) ·
+libSQL/Turso (analytics) · Recharts · Groq for inference ·
+Python + pandas for offline data preparation only

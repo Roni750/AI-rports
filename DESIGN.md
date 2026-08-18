@@ -247,7 +247,54 @@ not fix it.** Route-level evidence backs the constraint: SFO–MDW 93.0%, SFO–
 
 ---
 
-## 6. Running it
+## 6. Conversation analytics, and how the classifier is evaluated
+
+The agent answered questions and then forgot them. Every turn already produced a rich tool trace —
+tool name, arguments, outcome, duration — which was rendered once and discarded, and Groq returned
+token usage on every call that was parsed and thrown away. `/analytics` is built on closing that gap.
+
+**What it records.** Every turn is persisted with its tool trace, token counts, estimated cost,
+model latency and end-to-end latency, and its outcome (answered, truncated, errored). Failures are
+recorded too: an analytics table containing only successes describes a system that never fails.
+
+**How prompts are grouped.** A versioned taxonomy of ten umbrella topics, declared as configuration
+for the same reason the scoring weights are. Classification is two-stage:
+
+- **Rules, inline, free.** An ordered rule set over the prompt's lexicon and the tools the agent
+  actually invoked. Pure functions, no network, no measurable time.
+- **A model, batched, offline.** Only for what the rules decline.
+
+Measured on the gold set, the rule stage resolves **98.4% of prompts at $0**. That number is the
+argument: if a lookup table and a regex settle it, spending a model call is a choice to pay for
+nothing. The split also keeps classification off the request path, where it would compete with the
+answer a user is waiting for against a per-minute token budget.
+
+**How I know it works.** A 63-item labelled gold set, with per-class precision/recall/F1, a confusion
+matrix, and both accuracy denominators — abstentions counted as wrong, and abstentions excluded.
+Publishing only the second is how a classifier with a coverage problem looks excellent. `npm run
+verify` enforces floors on the deterministic stage live, and on the hybrid stage against a frozen
+prediction snapshot, so CI has a real accuracy gate with no network and no API key.
+
+**The number, and what it is not.** Macro-F1 is 0.984. That is *not* evidence of a strong classifier:
+I wrote the rules and then wrote the gold labels, so the set largely measures self-consistency. Its
+value is as a regression harness, and as a structure that can absorb genuinely independent examples —
+which is what the dashboard's "needs review" panel produces, closing the loop from observability back
+into evaluation. Treating 0.98 as an accuracy estimate for real traffic would be the "a good demo is
+not evidence" mistake.
+
+**Honesty carried in the data, not the prose.** Every aggregate returns an envelope modelled on the
+tool layer's `ResultEnvelope`: the sample size, the share of seeded traffic, generated caveats, and a
+confidence that drops on its own below twenty turns. A reader cannot receive a percentage without the
+reason to doubt it. Unpriced models report "cost unavailable" rather than a plausible guess, and
+seeded traffic is labelled wherever it appears with a one-click filter to exclude it.
+
+**Analytics is a passenger.** The write happens in Next's `after()`, after the response is flushed,
+so it costs the user nothing; `recordTurn` cannot throw; and if the store is unreachable the
+dashboard says so rather than rendering an empty chart that looks like an absence of traffic.
+
+---
+
+## 7. Running it
 
 ```bash
 npm install
@@ -265,15 +312,25 @@ npm run data:build       # -> data/aviation.db
 Verification:
 
 ```bash
-npm run verify           # typecheck + 56 tests
+npm run verify           # typecheck + 150 tests, including the classifier accuracy floors
 npm run data:smoke       # scoring engine against real data
 npm run data:verify-tools # the four questions end to end
 npm run models           # list models the configured key can use
 ```
 
+Analytics:
+
+```bash
+npm run analytics:migrate   # bring the analytics store to head (idempotent)
+npm run analytics:seed      # replay the seed corpus through the real agent, ~7 min
+npm run analytics:classify  # label anything the inline rule stage declined
+npm run eval:topics         # per-class P/R/F1 + confusion matrix, no network needed
+npm run eval:topics -- --hybrid --freeze   # regenerate the snapshot the CI gate scores
+```
+
 ---
 
-## 7. What I would do next
+## 8. What I would do next
 
 In priority order, with reasons rather than a wishlist:
 
