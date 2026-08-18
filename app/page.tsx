@@ -127,6 +127,19 @@ const EXAMPLES = [
   "What is the unmet flight demand in SFO airport and why?",
 ];
 
+/**
+ * What the status region announces while a turn runs.
+ *
+ * Named separately from the inline indicator so the two cannot drift: a screen reader hears the
+ * same thing a sighted reader sees, rather than a generic "loading" while the screen says which
+ * tool is executing.
+ */
+function statusLine(turn: Turn | undefined): string {
+  if (turn?.runningTool) return `Running ${turn.runningTool}…`;
+  if (turn?.content) return "Writing the answer…";
+  return "Querying the dataset…";
+}
+
 export default function Page() {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState("");
@@ -134,13 +147,29 @@ export default function Page() {
   const [error, setError] = useState<{ message: string; hint?: string } | null>(null);
   const [openTrace, setOpenTrace] = useState<number | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const answerRef = useRef<HTMLDivElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
+  /*
+   * Scroll once when a turn is added — deliberately NOT while it streams.
+   *
+   * The effect used to depend on `turns`, which now changes on every character, so a smooth scroll
+   * was being started and cancelled ~60 times a second. That reads as jitter, and it also fights
+   * anyone trying to scroll back to re-read something. Keying on the COUNT fires exactly once per
+   * question.
+   *
+   * The target is the head of the answer rather than the bottom of the page: an answer that grows
+   * past the fold should push text down from a stable reading position, not drag the viewport
+   * along behind it. `scroll-mt-*` on the element keeps the question visible above it.
+   */
   useEffect(() => {
+    if (turns.length === 0) return;
     // `scrollIntoView` takes its behaviour from this argument, not from the stylesheet, so the
     // reduced-motion rule in globals.css cannot reach it. Asked directly instead.
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    endRef.current?.scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "end" });
-  }, [turns, busy]);
+    const target = answerRef.current ?? endRef.current;
+    target?.scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "start" });
+  }, [turns.length]);
 
   async function send(text: string) {
     const question = text.trim();
@@ -153,6 +182,12 @@ export default function Page() {
     // bubble growing rather than a spinner that is replaced by a finished answer.
     setTurns([...nextTurns, { role: "assistant", content: "", trace: [], streaming: true }]);
     setBusy(true);
+
+    // Abandoning a long answer should cost one click, not a page reload. The route already passes
+    // its request signal down to the agent, so aborting here stops the model call too rather than
+    // just hiding output that keeps being paid for.
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     /** Applies a change to the assistant turn being streamed — always the last one. */
     const patch = (fn: (turn: Turn) => Turn) =>
@@ -212,6 +247,7 @@ export default function Page() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           messages: nextTurns.map((t) => ({ role: t.role, content: t.content })),
           sessionId: storedSessionToken(),
@@ -282,12 +318,18 @@ export default function Page() {
       if (failed) setTurns(nextTurns);
     } catch (err) {
       finishText("");
+      // A turn the user stopped is not a failure — drop the partial answer without an error.
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setTurns(nextTurns);
+        return;
+      }
       setTurns(nextTurns);
       setError({
         message: err instanceof Error ? err.message : "Network request failed.",
         hint: "Is the dev server still running?",
       });
     } finally {
+      abortRef.current = null;
       setBusy(false);
     }
   }
@@ -319,7 +361,7 @@ export default function Page() {
               type="button"
               onClick={() => send(q)}
               disabled={busy}
-              className="rounded-lg border border-current/15 px-3 py-2 text-left text-sm transition hover:border-current/40 hover:bg-current/5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current/50 disabled:opacity-50"
+              className="rounded-lg border border-current/15 px-3 py-2 text-left text-sm transition-colors hover:border-current/40 hover:bg-current/5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current/50 disabled:opacity-50"
             >
               {q}
             </button>
@@ -339,7 +381,11 @@ export default function Page() {
               {turn.content}
             </div>
           ) : (
-            <div key={i} className="flex flex-col gap-2">
+            <div
+              key={i}
+              ref={i === turns.length - 1 ? answerRef : undefined}
+              className="flex scroll-mt-20 flex-col gap-2"
+            >
               {/*
                 Drawn from the tool payloads, above the narration they belong to. Nothing here was
                 produced by the model: it chose the tool, the tool returned typed data, and the
@@ -456,7 +502,7 @@ export default function Page() {
           https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Reference/Roles/status_role
         */}
         <p className="text-sm opacity-60" role="status" aria-atomic="true">
-          {busy ? "Querying the dataset…" : ""}
+          {busy ? statusLine(turns[turns.length - 1]) : ""}
         </p>
 
         {error && (
@@ -477,7 +523,7 @@ export default function Page() {
           e.preventDefault();
           send(input);
         }}
-        className="sticky bottom-0 flex gap-2 border-t border-current/10 bg-[var(--background)] pt-3"
+        className="sticky bottom-0 flex gap-2 border-t border-current/10 bg-[var(--background)] pt-3 pb-[env(safe-area-inset-bottom)]"
       >
         <label htmlFor="question" className="sr-only">
           Ask about an airport
@@ -487,17 +533,26 @@ export default function Page() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder="Ask about an airport, a region, or a comparison…"
-          disabled={busy}
           autoComplete="off"
           className="min-w-0 flex-1 rounded-lg border border-current/20 bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-current/50 focus-visible:ring-2 focus-visible:ring-current/25 disabled:opacity-50"
         />
-        <button
-          type="submit"
-          disabled={busy || input.trim() === ""}
-          className="rounded-lg border border-current/20 px-4 py-2 text-sm font-medium transition hover:bg-current/10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current/50 disabled:opacity-40"
-        >
-          Ask
-        </button>
+        {busy ? (
+          <button
+            type="button"
+            onClick={() => abortRef.current?.abort()}
+            className="rounded-lg border border-current/20 px-4 py-2 text-sm font-medium transition-colors hover:bg-current/10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current/50"
+          >
+            Stop
+          </button>
+        ) : (
+          <button
+            type="submit"
+            disabled={input.trim() === ""}
+            className="rounded-lg border border-current/20 px-4 py-2 text-sm font-medium transition-colors hover:bg-current/10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current/50 disabled:opacity-40"
+          >
+            Ask
+          </button>
+        )}
       </form>
     </main>
   );
