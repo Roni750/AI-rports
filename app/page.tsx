@@ -128,16 +128,15 @@ const EXAMPLES = [
 ];
 
 /**
- * What the status region announces while a turn runs.
+ * The spoken twin of the indicator inside the answer bubble.
  *
- * Named separately from the inline indicator so the two cannot drift: a screen reader hears the
- * same thing a sighted reader sees, rather than a generic "loading" while the screen says which
- * tool is executing.
+ * Kept in one place so the two cannot drift: a screen reader hears what the screen shows rather
+ * than a generic "loading". Once text starts arriving the indicator disappears and this falls
+ * silent too — the answer itself is the progress at that point.
  */
 function statusLine(turn: Turn | undefined): string {
-  if (turn?.runningTool) return `Running ${turn.runningTool}…`;
-  if (turn?.content) return "Writing the answer…";
-  return "Querying the dataset…";
+  if (turn?.content) return "";
+  return turn?.runningTool ? `Running ${turn.runningTool}…` : "Thinking…";
 }
 
 export default function Page() {
@@ -494,14 +493,17 @@ export default function Page() {
         )}
 
         {/*
-          Rendered unconditionally, with only its text changing.
+          The screen-reader half of the progress indicator. Visually hidden on purpose: the
+          indicator inside the answer bubble already says this on screen, and printing it twice
+          was just noise.
 
-          A live region must already exist in the DOM before its content changes, or screen
-          readers can miss the announcement entirely — mounting the element and its text in the
-          same instant is the common way to get a status region that silently announces nothing.
+          Rendered unconditionally, with only its text changing. A live region must already exist
+          in the DOM before its content changes, or screen readers can miss the announcement
+          entirely — mounting the element and its text in the same instant is the common way to
+          get a status region that silently announces nothing.
           https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Reference/Roles/status_role
         */}
-        <p className="text-sm opacity-60" role="status" aria-atomic="true">
+        <p className="sr-only" role="status" aria-atomic="true">
           {busy ? statusLine(turns[turns.length - 1]) : ""}
         </p>
 
