@@ -205,7 +205,7 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
         <Stat label="Median latency" value={`${(kpis.data.p50TotalMs / 1000).toFixed(1)}s`} />
         <Stat label="p95 latency" value={`${(kpis.data.p95TotalMs / 1000).toFixed(1)}s`} />
         <Stat
-          label="Mean tokens / turn"
+          label="Tokens / turn"
           value={kpis.data.meanTokensPerTurn === null ? "—" : Math.round(kpis.data.meanTokensPerTurn).toLocaleString()}
         />
         {/* The figure this whole layer exists to make sayable. */}
@@ -217,7 +217,7 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
       {/* ------------- 2. the umbrella */}
       <Panel
         title="Topics"
-        subtitle="Every user prompt grouped under one umbrella. Unclassified is shown, not hidden."
+        subtitle="What people ask about. Unclassified is shown, not hidden."
         envelope={topics}
       >
         <TopicBars
@@ -254,7 +254,7 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
       {/* ------------- 3. the other dimension: what the questions were about */}
       <Panel
         title="Airports asked about"
-        subtitle="Topics say what kind of question; this says what it was about. Counted from the prompt and the tool arguments only — never from what a tool returned."
+        subtitle="Which airports — counted from prompts and tool arguments, never from results."
         envelope={airports}
       >
         <AirportBars data={airports.data} />
@@ -290,10 +290,9 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
           to a tool counts in both. Said here rather than drawn, because a stacked bar would
           silently double most of them.
         */}
-        <p className="mt-3 text-xs opacity-60">
-          The last two columns overlap — a turn can both name an airport and resolve to it, so they
-          do not sum to the turn count. A high &quot;resolved by agent&quot; against a low &quot;named
-          by user&quot; means the agent reached somewhere nobody asked for by name.
+        <p className="mt-3 text-xs opacity-55">
+          The last two columns overlap, so they do not sum to the turn count. Resolved running well
+          above named means the agent reached somewhere nobody asked for.
         </p>
 
         {(phrasings.data.length > 0 || gaps.data.length > 0) && (
@@ -337,7 +336,7 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
       {/* ------------- 4. volume */}
       <Panel
         title="Volume"
-        subtitle="Turns and sessions per day. The gap between them is how often people follow up."
+        subtitle="Turns and sessions per day. The gap is how often people follow up."
         envelope={volume}
       >
         <VolumeArea data={volume.data} />
@@ -346,16 +345,16 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
       {/* ------------- 5. reliability */}
       <Panel
         title="Reliability"
-        subtitle="Which step degrades, and what per-step reliability implies end to end."
+        subtitle="Where turns fail, and what that compounds to end to end."
         envelope={quality}
       >
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
           <Stat label="Answered" value={pct(quality.data.answeredRate)} />
           <Stat label="Truncated" value={pct(quality.data.truncationRate)} />
           <Stat label="Errored" value={pct(quality.data.errorRate)} />
-          <Stat label="Tool call success" value={pct(quality.data.toolCallSuccessRate)} />
+          <Stat label="Tool success" value={pct(quality.data.toolCallSuccessRate)} />
           <Stat label="Tool calls / turn" value={quality.data.meanToolCallsPerTurn.toFixed(1)} />
-          <Stat label="Replied with no tool" value={pct(quality.data.zeroToolAnswerRate)} />
+          <Stat label="No-tool replies" value={pct(quality.data.zeroToolAnswerRate)} />
         </div>
         {/*
           This number is easy to misread as an invariant breach, so it is annotated rather than
@@ -364,11 +363,10 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
           the system prompt — all correct. Distinguishing those from a fabricated answer needs a
           numeric-fidelity check, which is listed as future work rather than implied here.
         */}
-        <p className="mt-3 text-xs opacity-60">
-          A reply with no tool call is not necessarily a fabricated one: clarification requests,
-          refusals of out-of-scope questions, and methodology answers all legitimately use no tool.
-          Telling those apart from an invented figure needs a numeric-fidelity check — asserting
-          every number in an answer appears in a tool result — which is not built yet.
+        <p className="mt-3 text-xs opacity-55">
+          No-tool replies are not automatically fabrications: clarifications, refusals and
+          methodology answers legitimately use none. Separating those from an invented figure needs
+          a numeric-fidelity check, which is not built yet.
         </p>
         {quality.data.compounding && (
           // Generated from this window's own numbers rather than asserted as a general principle.
@@ -381,7 +379,7 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
       {/* ------------- 6. tools */}
       <Panel
         title="Tool usage"
-        subtitle="Which tools the model actually reaches for, and what each costs in time."
+        subtitle="What the model reaches for, and what each call costs."
         envelope={tools}
       >
         <ToolBars data={tools.data} />
@@ -412,7 +410,7 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
       {/* ------------- 7. the classifier, reporting on itself */}
       <Panel
         title="Classifier health"
-        subtitle="How labels were produced, and what producing them cost."
+        subtitle="How labels were produced, and what they cost."
         envelope={health}
       >
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -420,20 +418,19 @@ export default async function AnalyticsPage({ searchParams }: PageProps<"/analyt
             <Stat key={s.stage} label={`${s.stage} labels`} value={`${s.turns} (${pct(s.share)})`} />
           ))}
           <Stat label="Unlabelled" value={String(health.data.unlabelledTurns)} />
-          <Stat label="Classification spend" value={formatUsd(health.data.classificationCostUsd)} emphasis />
+          <Stat label="Labelling cost" value={formatUsd(health.data.classificationCostUsd)} emphasis />
         </div>
-        <p className="mt-3 text-xs opacity-60">
-          Active version <code className="font-mono">{health.data.activeVersion}</code>. Labels are
-          never overwritten — a new version writes new rows, so two classifiers can be compared over
-          identical traffic. Prices checked {PRICES_CHECKED_ON}; unpriced models report no cost
-          rather than a guess.
+        <p className="mt-3 text-xs opacity-55">
+          Version <code className="font-mono">{health.data.activeVersion}</code>. Labels are never
+          overwritten, so two classifiers can be compared over identical traffic. Prices checked{" "}
+          {PRICES_CHECKED_ON}; unpriced models report no cost rather than a guess.
         </p>
       </Panel>
 
       {/* ------------- 8. the loop back to the eval */}
       <Panel
         title="Needs review"
-        subtitle="Lowest-confidence prompts. These are the next gold-set entries, not a backlog."
+        subtitle="Lowest-confidence prompts — the next gold-set entries."
         envelope={review}
       >
         {review.data.length === 0 ? (
@@ -593,8 +590,8 @@ function Panel({
   return (
     <section className="flex flex-col gap-3">
       <div>
-        <h2 className="text-sm font-semibold">{title}</h2>
-        <p className="text-xs opacity-60">{subtitle}</p>
+        <h2 className="text-base font-bold tracking-tight">{title}</h2>
+        <p className="text-xs opacity-55">{subtitle}</p>
       </div>
       <div className="overflow-x-auto rounded-lg border border-current/10 p-3">{children}</div>
       <Caveats envelope={envelope} />
