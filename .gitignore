@@ -44,6 +44,12 @@ next-env.d.ts
 data/raw/
 data/*.log
 
+# SQLite write-ahead sidecars. The analytics database itself IS committed once seeded, so a
+# fresh clone and a deploy both have something honest to show — but the sidecars are transient
+# and would produce a dirty tree after every request.
+data/*.db-wal
+data/*.db-shm
+
 # Python
 __pycache__/
 *.pyc

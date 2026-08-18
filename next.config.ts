@@ -9,7 +9,19 @@ const nextConfig: NextConfig = {
    * Keys are route globs; values are globs resolved from the project root.
    */
   outputFileTracingIncludes: {
-    "/api/**": ["./data/aviation.db"],
+    "/api/**": ["./data/aviation.db", "./data/analytics.db"],
+    /**
+     * Both keys are needed, and this is the trap worth remembering: the glob `"/analytics/**"`
+     * does NOT match `/analytics` itself, so the dashboard route needs its own entry alongside the
+     * one covering its children.
+     *
+     * These matter only when ANALYTICS_DB_URL is a `file:` URL. A deployment pointed at Turso
+     * reads over HTTP and needs no bundled file — but a deploy that forgets to set the variable
+     * falls back to the local file, and failing with a missing-file error is a far worse outcome
+     * than shipping a small database nobody reads.
+     */
+    "/analytics": ["./data/analytics.db"],
+    "/analytics/**": ["./data/analytics.db"],
   },
 };
 
