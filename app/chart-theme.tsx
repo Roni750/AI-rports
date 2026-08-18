@@ -47,6 +47,20 @@ export const tooltipProps = {
   itemStyle: { color: "var(--foreground)" },
   labelStyle: { color: "var(--foreground)", opacity: 0.6 },
   cursor: { fill: "currentColor", opacity: 0.05 },
+  /*
+   * Lifts the tooltip above any chart that follows it.
+   *
+   * Recharts gives every `.recharts-wrapper` `position: relative` and no z-index. Positioned
+   * siblings paint in DOM order, so a tooltip belonging to one chart is painted OVER by the next
+   * chart down — the flight-mix "By distance" tooltip was disappearing behind the "By destination"
+   * bar. The tooltip is only tall enough to overlap a neighbour on the short 52px bars, which is
+   * why it looked like a bug in one chart rather than a shared default.
+   *
+   * Fixed here rather than on the one chart that showed it: any two stacked charts would hit it,
+   * and a tooltip that can be covered is wrong everywhere. 10 is enough to clear sibling content
+   * while staying under the app's own overlays.
+   */
+  wrapperStyle: { zIndex: 10 },
 } as const;
 
 /**
