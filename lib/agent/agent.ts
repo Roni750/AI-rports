@@ -32,8 +32,19 @@ const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
  */
 export const DEFAULT_MODEL = process.env.GROQ_MODEL ?? "openai/gpt-oss-120b";
 
-/** Bounds the loop. Each iteration is one model call plus its tool executions. */
-const MAX_ITERATIONS = 6;
+/**
+ * Bounds the loop. Each iteration is one model call plus its tool executions.
+ *
+ * Three, not six, and the binding constraint is the TOKEN BUDGET rather than latency. Every
+ * iteration re-sends the whole conversation, and the fixed overhead alone -- system prompt plus the
+ * six tool schemas -- is about 1,700 tokens per call before any airport data. A six-iteration turn
+ * measured 17,062 prompt tokens, which is more than twice the 8,000-per-minute free-tier
+ * allowance: it could not succeed, and it drained the window so the NEXT few questions failed too.
+ *
+ * Little is lost. That turn hit the cap and truncated anyway, so the extra iterations bought a more
+ * expensive failure rather than an answer. Raise this only alongside a higher rate limit.
+ */
+const MAX_ITERATIONS = 3;
 
 /**
  * How long one model call may take before it is abandoned.
@@ -308,21 +319,65 @@ async function callModel(
 		}
 
 		if (res.status === 429) {
-			// Retry rather than failing: the token window resets in tens of seconds, and a demo that
+			/*
+			 * Groq enforces four separate buckets: tokens and requests, each per minute and per day.
+			 * Only the per-MINUTE ones come back as headers, so a 429 with a full token window does not
+			 * mean "your request is too big" -- far more often it means a longer-window quota is spent
+			 * and the minute bucket is simply irrelevant.
+			 *
+			 * Guessing between them produced actively harmful advice ("ask something narrower") for a
+			 * daily cap, where nothing the user types can help. So report what the headers actually say
+			 * and let the numbers speak, rather than asserting a cause we cannot see.
+			 */
+			const num = (h: string) => {
+				const v = Number(res.headers.get(h));
+				return Number.isFinite(v) ? v : null;
+			};
+			const limitTokens = num("x-ratelimit-limit-tokens");
+			const remainingTokens = num("x-ratelimit-remaining-tokens");
+			const remainingRequests = num("x-ratelimit-remaining-requests");
+			const resetTokens = res.headers.get("x-ratelimit-reset-tokens");
+			const retryAfter = res.headers.get("retry-after");
+
+			// Visible in the server log, because these four numbers are the whole diagnosis and the
+			// browser only ever sees the sentence below.
+			console.warn(
+				"[groq 429]",
+				JSON.stringify({limitTokens, remainingTokens, remainingRequests, resetTokens, retryAfter, attempt}),
+			);
+
+			// A full minute-window that still refuses means the block is NOT the per-minute token
+			// bucket. Retrying re-sends the same prompt against a quota that is not going to move.
+			const minuteWindowIsFull =
+				limitTokens !== null && remainingTokens !== null && limitTokens > 0 &&
+				remainingTokens >= limitTokens * 0.9;
+
+			if (minuteWindowIsFull) {
+				throw new AgentError(
+					"Groq refused the request while the per-minute allowance was still full.",
+					429,
+					`${remainingTokens} of ${limitTokens} tokens/minute remain` +
+					(remainingRequests !== null ? `, ${remainingRequests} requests` : "") +
+					". A full minute window means a longer-window quota is exhausted — most likely the " +
+					"daily token cap — so waiting a moment or asking something shorter will not help. " +
+					"Check the Groq console for daily usage, or use a different key.",
+				);
+			}
+
+			// Genuinely throttled on the minute bucket: it refills in tens of seconds, and a demo that
 			// recovers on its own is worth far more than one that shows an error.
 			if (attempt < MAX_RATE_LIMIT_RETRIES) {
 				if (stats) stats.rateLimitRetries++;
 				await sleep(retryDelayMs(res.headers, attempt), signal);
 				continue;
 			}
-			const remaining = res.headers.get("x-ratelimit-remaining-tokens");
-			const reset = res.headers.get("x-ratelimit-reset-tokens");
+
 			throw new AgentError(
 				"Groq's rate limit is still in effect after retrying.",
 				429,
-				`The free tier allows about 8,000 tokens per minute` +
-				(remaining ? `; ${remaining} remain` : "") +
-				(reset ? `, resetting in ${reset}` : "") +
+				`About ${limitTokens ?? 8000} tokens per minute are allowed` +
+				(remainingTokens !== null ? `; ${remainingTokens} remain` : "") +
+				(resetTokens ? `, resetting in ${resetTokens}` : "") +
 				". Wait a moment and ask again.",
 			);
 		}
