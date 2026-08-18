@@ -213,6 +213,7 @@ async function callModel(
 	signal?: AbortSignal,
 	withTools = true,
 	stats?: CallStats,
+	onDelta?: (delta: string) => void,
 ): Promise<Anthropic.Message> {
 	const params: Anthropic.MessageCreateParamsNonStreaming = {
 		model,
@@ -261,9 +262,15 @@ async function callModel(
 		// The caller's signal AND a timeout: the first aborts when the user goes away, the second
 		// when the provider stops answering. Either alone leaves one of the two hangs open.
 		const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
-		const message = await anthropic(apiKey).messages.create(params, {
+		/*
+		 * Streamed even when nobody is listening for deltas. Beyond the UI, it removes the HTTP
+		 * timeout that a large max_tokens would otherwise risk on a non-streaming request.
+		 */
+		const stream = anthropic(apiKey).messages.stream(params, {
 			signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
 		});
+		if (onDelta) stream.on("text", onDelta);
+		const message = await stream.finalMessage();
 
 		if (stats) {
 			// Token counts ride along on every response and used to be parsed and dropped. They
@@ -343,11 +350,34 @@ function textOf(message: Anthropic.Message): string {
 		.trim();
 }
 
+/**
+ * Progress from a turn, as it happens.
+ *
+ * A turn is two model calls with a tool execution between them, and the answer text only exists
+ * after the second. Emitting the tool result the moment it lands means the chart renders while the
+ * model is still writing the prose about it — which is most of the perceived-latency win here, more
+ * than the text deltas are.
+ *
+ * `done` carries everything that can only be known once the reply is complete, the mustMention
+ * check above all: whether a required fact was relayed is a property of the finished text.
+ */
+export type AgentEvent =
+	| {type: "tool_start"; name: string}
+	| {type: "tool_done"; entry: ToolTraceEntry}
+	| {type: "text"; delta: string}
+	| {type: "done"; result: AgentResult};
+
 export async function runAgent(
 	history: ChatMessage[],
-	options: { apiKey: string; model?: string; signal?: AbortSignal } = {apiKey: ""},
+	options: {
+		apiKey: string;
+		model?: string;
+		signal?: AbortSignal;
+		/** Called as the turn unfolds. Omit it and the turn behaves exactly as before. */
+		onEvent?: (event: AgentEvent) => void;
+	} = {apiKey: ""},
 ): Promise<AgentResult> {
-	const {apiKey, signal} = options;
+	const {apiKey, signal, onEvent} = options;
 	const model = options.model ?? DEFAULT_MODEL;
 
 	if (!apiKey) {
@@ -419,7 +449,9 @@ export async function runAgent(
 			cacheReadTokens: 0,
 		};
 		try {
-			return await callModel(msgs, apiKey, model, signal, withTools, stats);
+			return await callModel(msgs, apiKey, model, signal, withTools, stats, (delta) =>
+				onEvent?.({type: "text", delta}),
+			);
 		} finally {
 			// Recorded even on failure — a slow call that then errors is exactly the case worth seeing.
 			modelMs.push(Date.now() - t0);
@@ -473,6 +505,7 @@ export async function runAgent(
 
 		for (const call of toolCalls) {
 			const started = Date.now();
+			onEvent?.({type: "tool_start", name: call.name});
 			// `input` arrives already parsed, so there is no JSON string to decode and no parse
 			// error to handle — dispatchTool still validates every parameter.
 			const args = (call.input ?? {}) as Record<string, unknown>;
@@ -482,14 +515,17 @@ export async function runAgent(
 
 			const payload = payloadFor(call.name, result);
 
-			trace.push({
+			const entry: ToolTraceEntry = {
 				name: call.name,
 				arguments: args,
 				ok: result.ok,
 				...(result.ok ? {} : {errorCode: result.code}),
 				durationMs: Date.now() - started,
 				...(payload ? {payload} : {}),
-			});
+			};
+			trace.push(entry);
+			// Carries the chart payload, so the client can draw before any prose exists.
+			onEvent?.({type: "tool_done", entry});
 
 			toolResults.push({
 				type: "tool_result",

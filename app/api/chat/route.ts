@@ -129,75 +129,105 @@ export async function POST(request: Request) {
     historyTurns: turnIndex,
   };
 
-  try {
-    const result = await runAgent(parsed, {
-      apiKey: process.env.ANTHROPIC_API_KEY ?? "",
-      signal: request.signal,
-    });
+  /*
+   * Streamed as newline-delimited JSON rather than returned whole.
+   *
+   * NDJSON rather than SSE: the client is a `fetch` reader, not an EventSource, so the extra
+   * framing would buy nothing. One JSON object per line, parsed as lines arrive.
+   *
+   * The trade this makes: the HTTP status is committed the moment the first byte goes out, so a
+   * failure partway through a turn can no longer be a 500. It arrives as an `error` event instead,
+   * and the client renders it in place of the answer.
+   */
+  const encoder = new TextEncoder();
+  let settled = false;
 
-    const response = Response.json({ ...result, sessionId: session.token });
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (event: unknown) => {
+        controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
+      };
 
-    after(() =>
-      recordTurn({
-        ...baseRecord,
-        replyChars: result.reply.length,
-        model: result.model,
-        iterations: result.iterations,
-        modelCalls: result.timing.modelMs.length,
-        promptTokens: result.usage.promptTokens,
-        completionTokens: result.usage.completionTokens,
-        modelMs: result.timing.totalModelMs,
-        totalMs: Date.now() - startedAt,
-        outcome: result.truncated ? "truncated" : "answered",
-        errorKind: null,
-        // An explicit projection, not a spread minus one key. Chart payloads are orders of
-        // magnitude larger than the rest of a trace row and nothing queries them, and stating the
-        // columns here means a field added to the trace later cannot leak into analytics silently.
-        toolTrace: result.trace.map((t) => ({
-          name: t.name,
-          arguments: t.arguments,
-          ok: t.ok,
-          ...(t.errorCode ? { errorCode: t.errorCode } : {}),
-          durationMs: t.durationMs,
-        })),
-      }),
-    );
+      try {
+        const result = await runAgent(parsed, {
+          apiKey: process.env.ANTHROPIC_API_KEY ?? "",
+          signal: request.signal,
+          onEvent: (event) => {
+            // `done` is sent below with the session token attached, so it is not forwarded here.
+            if (event.type !== "done") send(event);
+          },
+        });
 
-    return response;
-  } catch (err) {
-    // Failures are recorded too. An analytics table containing only successes would report a
-    // perfect system and hide the exact turns worth investigating.
-    after(() =>
-      recordTurn({
-        ...baseRecord,
-        replyChars: 0,
-        // DEFAULT_MODEL, not the env var: ANTHROPIC_MODEL is an optional override and is normally
-        // unset, so reading it directly recorded every failed turn as "unknown" — losing the
-        // attribution on exactly the rows where "which model failed?" is the question.
-        model: DEFAULT_MODEL,
-        iterations: 0,
-        modelCalls: 0,
-        promptTokens: null,
-        completionTokens: null,
-        modelMs: 0,
-        totalMs: Date.now() - startedAt,
-        outcome: "error",
-        errorKind: errorKindOf(err, request.signal),
-        toolTrace: [],
-      }),
-    );
+        send({ type: "done", result, sessionId: session.token });
+        settled = true;
 
-    if (err instanceof AgentError) {
-      return Response.json(
-        { error: err.message, hint: err.hint, sessionId: session.token },
-        { status: err.status >= 400 && err.status < 600 ? err.status : 500 },
-      );
-    }
-    // Never leak an internal stack trace to the client.
-    console.error("[chat] unexpected failure", err);
-    return Response.json(
-      { error: "The agent failed unexpectedly.", sessionId: session.token },
-      { status: 500 },
-    );
-  }
+        after(() =>
+          recordTurn({
+            ...baseRecord,
+            replyChars: result.reply.length,
+            model: result.model,
+            iterations: result.iterations,
+            modelCalls: result.timing.modelMs.length,
+            promptTokens: result.usage.promptTokens,
+            completionTokens: result.usage.completionTokens,
+            modelMs: result.timing.totalModelMs,
+            totalMs: Date.now() - startedAt,
+            outcome: result.truncated ? "truncated" : "answered",
+            errorKind: null,
+            // An explicit projection, not a spread minus one key. Chart payloads are orders of
+            // magnitude larger than the rest of a trace row and nothing queries them, and stating
+            // the columns here means a field added to the trace later cannot leak into analytics
+            // silently.
+            toolTrace: result.trace.map((t) => ({
+              name: t.name,
+              arguments: t.arguments,
+              ok: t.ok,
+              ...(t.errorCode ? { errorCode: t.errorCode } : {}),
+              durationMs: t.durationMs,
+            })),
+          }),
+        );
+      } catch (err) {
+        const kind = errorKindOf(err, request.signal);
+        send({
+          type: "error",
+          error: err instanceof AgentError ? err.message : "Something went wrong.",
+          hint: err instanceof AgentError ? err.hint : undefined,
+          kind,
+        });
+        settled = true;
+
+        // Failures are recorded too. An analytics table containing only successes would report a
+        // perfect system and hide the exact turns worth investigating.
+        after(() =>
+          recordTurn({
+            ...baseRecord,
+            replyChars: 0,
+            model: DEFAULT_MODEL,
+            iterations: 0,
+            modelCalls: 0,
+            promptTokens: null,
+            completionTokens: null,
+            modelMs: 0,
+            totalMs: Date.now() - startedAt,
+            outcome: "error",
+            errorKind: kind,
+            toolTrace: [],
+          }),
+        );
+      } finally {
+        if (!settled) send({ type: "error", error: "The turn ended unexpectedly.", kind: "unexpected" });
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-store",
+      // Proxies that buffer a response would defeat the point of streaming it.
+      "X-Accel-Buffering": "no",
+    },
+  });
 }

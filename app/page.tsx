@@ -40,9 +40,30 @@ interface ToolTraceEntry {
   payload?: ChartPayload;
 }
 
+/** One line of the NDJSON stream from POST /api/chat. */
+type StreamEvent =
+  | { type: "tool_start"; name: string }
+  | { type: "tool_done"; entry: ToolTraceEntry }
+  | { type: "text"; delta: string }
+  | { type: "done"; sessionId: string; result: AgentResultPayload }
+  | { type: "error"; error: string; hint?: string };
+
+interface AgentResultPayload {
+  reply: string;
+  trace: ToolTraceEntry[];
+  model: string;
+  truncated: boolean;
+  usage: { promptTokens: number | null; completionTokens: number | null };
+  timing: { totalMs: number };
+}
+
 interface Turn {
   role: "user" | "assistant";
   content: string;
+  /** True while the answer is still arriving, so the UI can show it is not finished. */
+  streaming?: boolean;
+  /** The tool currently executing, shown between the call and its result. */
+  runningTool?: string;
   trace?: ToolTraceEntry[];
   model?: string;
   truncated?: boolean;
@@ -128,8 +149,14 @@ export default function Page() {
     setError(null);
     setInput("");
     const nextTurns: Turn[] = [...turns, { role: "user", content: question }];
-    setTurns(nextTurns);
+    // The assistant turn is created empty and filled in as the stream arrives, so there is one
+    // bubble growing rather than a spinner that is replaced by a finished answer.
+    setTurns([...nextTurns, { role: "assistant", content: "", trace: [], streaming: true }]);
     setBusy(true);
+
+    /** Applies a change to the assistant turn being streamed — always the last one. */
+    const patch = (fn: (turn: Turn) => Turn) =>
+      setTurns((prev) => prev.map((t, i) => (i === prev.length - 1 ? fn(t) : t)));
 
     try {
       const res = await fetch("/api/chat", {
@@ -140,29 +167,69 @@ export default function Page() {
           sessionId: storedSessionToken(),
         }),
       });
-      const data = await res.json();
-      // Stored before the status check: the error paths return a token too, so a session survives
-      // a failed turn instead of splitting the conversation in the analytics table.
-      rememberSessionToken(data.sessionId);
 
-      if (!res.ok) {
-        setError({ message: data.error ?? `Request failed (${res.status})`, hint: data.hint });
-        return;
+      if (!res.body) throw new Error("The server returned no response body.");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let failed = false;
+
+      // NDJSON: one JSON object per line. A chunk can split a line anywhere, so the tail stays in
+      // the buffer until its newline arrives rather than being parsed as a truncated object.
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let newline: number;
+        while ((newline = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, newline).trim();
+          buffer = buffer.slice(newline + 1);
+          if (!line) continue;
+
+          const event = JSON.parse(line) as StreamEvent;
+          switch (event.type) {
+            case "tool_start":
+              patch((t) => ({ ...t, runningTool: event.name }));
+              break;
+            case "tool_done":
+              // The chart is drawn from here, well before any prose exists.
+              patch((t) => ({
+                ...t,
+                trace: [...(t.trace ?? []), event.entry],
+                runningTool: undefined,
+              }));
+              break;
+            case "text":
+              patch((t) => ({ ...t, content: t.content + event.delta }));
+              break;
+            case "done":
+              rememberSessionToken(event.sessionId);
+              patch((t) => ({
+                ...t,
+                content: event.result.reply,
+                trace: event.result.trace,
+                model: event.result.model,
+                truncated: event.result.truncated,
+                usage: event.result.usage,
+                timing: event.result.timing,
+                streaming: false,
+                runningTool: undefined,
+              }));
+              break;
+            case "error":
+              failed = true;
+              setError({ message: event.error, hint: event.hint });
+              break;
+          }
+        }
       }
 
-      setTurns((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: data.reply,
-          trace: data.trace,
-          model: data.model,
-          truncated: data.truncated,
-          usage: data.usage,
-          timing: data.timing,
-        },
-      ]);
+      // An error event replaces the answer rather than leaving a half-written one on screen.
+      if (failed) setTurns(nextTurns);
     } catch (err) {
+      setTurns(nextTurns);
       setError({
         message: err instanceof Error ? err.message : "Network request failed.",
         hint: "Is the dev server still running?",
@@ -233,7 +300,23 @@ export default function Page() {
 
               <div className="answer text-sm leading-relaxed">
                 <Markdown remarkPlugins={[remarkGfm]}>{turn.content}</Markdown>
+                {/* A caret only while text is actually arriving — it marks the live edge. */}
+                {turn.streaming && turn.content.length > 0 && (
+                  <span className="ml-0.5 inline-block h-4 w-[2px] animate-pulse bg-current align-text-bottom" />
+                )}
               </div>
+
+              {/*
+                Shown between a tool call and its result. The agent's slowest moment is waiting on
+                the model, not the tool, but naming the tool is what makes the wait legible: the
+                reader sees WHICH question is being answered rather than a generic spinner.
+              */}
+              {turn.streaming && turn.content.length === 0 && (
+                <p className="flex items-center gap-2 text-xs opacity-60">
+                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-current" />
+                  {turn.runningTool ? `Running ${turn.runningTool}…` : "Thinking…"}
+                </p>
+              )}
 
               {turn.truncated && (
                 <p className="text-xs text-amber-600 dark:text-amber-500">
