@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { after } from "next/server";
 
-import { AgentError, runAgent, type ChatMessage } from "../../../lib/agent/agent";
+import {
+  AgentError,
+  DEFAULT_MODEL,
+  runAgent,
+  type ChatMessage,
+} from "../../../lib/agent/agent";
 import { recordTurn } from "../../../lib/analytics/record";
 import { APP_VERSION, DEFAULT_TENANT } from "../../../lib/analytics/config";
 import type { ErrorKind } from "../../../lib/analytics/types";
@@ -145,7 +150,10 @@ export async function POST(request: Request) {
       recordTurn({
         ...baseRecord,
         replyChars: 0,
-        model: process.env.GROQ_MODEL ?? "unknown",
+        // DEFAULT_MODEL, not the env var: GROQ_MODEL is an optional override and is normally
+        // unset, so reading it directly recorded every failed turn as "unknown" — losing the
+        // attribution on exactly the rows where "which model failed?" is the question.
+        model: DEFAULT_MODEL,
         iterations: 0,
         modelCalls: 0,
         promptTokens: null,
