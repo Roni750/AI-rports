@@ -6,8 +6,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "setup": "npm install && npm run doctor",
+    "doctor": "node scripts/doctor.mjs",
     "lint": "eslint",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "next typegen && tsc --noEmit",
     "test": "vitest run",
     "verify": "npm run typecheck && npm run test",
     "data:download": "python scripts/download_data.py",
@@ -41,5 +43,8 @@
     "tsx": "^4.23.12",
     "typescript": "^5",
     "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=22.5.0"
   }
 }
