@@ -14,13 +14,20 @@
     "data:build": "python scripts/build_dataset.py && python scripts/build_delays.py",
     "data:smoke": "tsx scripts/smoke-score.ts",
     "data:verify-tools": "tsx scripts/verify-tools.ts",
+    "analytics:migrate": "tsx scripts/analytics-migrate.ts",
+    "analytics:classify": "tsx scripts/classify-turns.ts",
+    "analytics:seed": "tsx scripts/seed-analytics.ts",
+    "analytics:prune": "tsx scripts/analytics-prune.ts",
+    "eval:topics": "tsx scripts/eval-topics.ts",
     "models": "tsx scripts/list-models.ts"
   },
   "dependencies": {
+    "@libsql/client": "^0.17.4",
     "next": "16.3.1",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-markdown": "^10.1.0",
+    "recharts": "^3.10.1",
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
