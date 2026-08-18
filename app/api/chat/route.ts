@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { after } from "next/server";
 
 import {
@@ -8,6 +7,7 @@ import {
   type ChatMessage,
 } from "../../../lib/agent/agent";
 import { recordTurn } from "../../../lib/analytics/record";
+import { mintSessionToken, verifySessionToken } from "../../../lib/analytics/session";
 import { APP_VERSION, DEFAULT_TENANT } from "../../../lib/analytics/config";
 import type { ErrorKind } from "../../../lib/analytics/types";
 
@@ -29,14 +29,20 @@ const MAX_CHARS = 4000;
 /**
  * A session id identifies a conversation for analytics and nothing else.
  *
- * Validation therefore DEGRADES rather than rejects: a malformed id earns a fresh one, it does not
- * fail the request. Refusing to answer a question because its telemetry label was malformed would
- * invert the priority between the product and the measurement of it.
+ * Validation therefore DEGRADES rather than rejects: an unrecognised token earns a fresh session,
+ * it does not fail the request. Refusing to answer a question because its telemetry label was
+ * malformed would invert the priority between the product and the measurement of it.
+ *
+ * It is a SIGNED token rather than a bare UUID because `turn_id` is derived from it and the turn
+ * write is an upsert — accepting any well-formed id let a caller name, and therefore rewrite,
+ * another conversation's recorded turn. See `lib/analytics/session.ts`.
  */
-const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function sessionFrom(raw: unknown): { id: string; token: string } {
+  const verified = verifySessionToken(raw);
+  if (verified !== null) return { id: verified, token: raw as string };
 
-function sessionIdFrom(raw: unknown): string {
-  return typeof raw === "string" && UUID_V4.test(raw) ? raw : randomUUID();
+  const token = mintSessionToken();
+  return { id: verifySessionToken(token)!, token };
 }
 
 /**
@@ -45,7 +51,12 @@ function sessionIdFrom(raw: unknown): string {
  * A message is prose that changes when someone rewords it; a category is a dimension that still
  * groups correctly six months later.
  */
-function errorKindOf(err: unknown): ErrorKind {
+function errorKindOf(err: unknown, signal: AbortSignal): ErrorKind {
+  // Checked first, and before the AgentError branch. A client that closes the tab mid-answer
+  // aborts `request.signal`, the in-flight fetch rejects with an AbortError, and every one of
+  // those used to be recorded as "unexpected" — so the reliability panel counted abandoned
+  // requests as failures of the agent. A cancellation is a fact about the user, not the system.
+  if (signal.aborted || (err instanceof Error && err.name === "AbortError")) return "cancelled";
   if (!(err instanceof AgentError)) return "unexpected";
   if (err.status === 429) return "rate_limit";
   if (err.status === 401) return "auth";
@@ -96,7 +107,8 @@ export async function POST(request: Request) {
     return Response.json({ error: parsed }, { status: 400 });
   }
 
-  const sessionId = sessionIdFrom(body.sessionId);
+  const session = sessionFrom(body.sessionId);
+  const sessionId = session.id;
   // Derived, not sent. The client already posts the whole history, so the server can count the
   // turn itself — one less value a client could lie about, and it is what makes `turn_id`
   // deterministic and therefore the write idempotent.
@@ -123,7 +135,7 @@ export async function POST(request: Request) {
       signal: request.signal,
     });
 
-    const response = Response.json({ ...result, sessionId });
+    const response = Response.json({ ...result, sessionId: session.token });
 
     after(() =>
       recordTurn({
@@ -138,7 +150,16 @@ export async function POST(request: Request) {
         totalMs: Date.now() - startedAt,
         outcome: result.truncated ? "truncated" : "answered",
         errorKind: null,
-        toolTrace: result.trace,
+        // An explicit projection, not a spread minus one key. Chart payloads are orders of
+        // magnitude larger than the rest of a trace row and nothing queries them, and stating the
+        // columns here means a field added to the trace later cannot leak into analytics silently.
+        toolTrace: result.trace.map((t) => ({
+          name: t.name,
+          arguments: t.arguments,
+          ok: t.ok,
+          ...(t.errorCode ? { errorCode: t.errorCode } : {}),
+          durationMs: t.durationMs,
+        })),
       }),
     );
 
@@ -161,21 +182,21 @@ export async function POST(request: Request) {
         modelMs: 0,
         totalMs: Date.now() - startedAt,
         outcome: "error",
-        errorKind: errorKindOf(err),
+        errorKind: errorKindOf(err, request.signal),
         toolTrace: [],
       }),
     );
 
     if (err instanceof AgentError) {
       return Response.json(
-        { error: err.message, hint: err.hint, sessionId },
+        { error: err.message, hint: err.hint, sessionId: session.token },
         { status: err.status >= 400 && err.status < 600 ? err.status : 500 },
       );
     }
     // Never leak an internal stack trace to the client.
     console.error("[chat] unexpected failure", err);
     return Response.json(
-      { error: "The agent failed unexpectedly.", sessionId },
+      { error: "The agent failed unexpectedly.", sessionId: session.token },
       { status: 500 },
     );
   }
