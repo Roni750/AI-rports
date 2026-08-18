@@ -1,0 +1,323 @@
+{
+  "classifierVersion": "rules@1|llm@openai/gpt-oss-20b|tax@1",
+  "model": "openai/gpt-oss-20b",
+  "mode": "hybrid",
+  "generatedAt": "2026-08-17T19:21:43.207Z",
+  "predictions": [
+    {
+      "id": "g-001",
+      "predictedTopicId": "screening_ranking",
+      "stage": "rule"
+    },
+    {
+      "id": "g-002",
+      "predictedTopicId": "screening_ranking",
+      "stage": "rule"
+    },
+    {
+      "id": "g-003",
+      "predictedTopicId": "screening_ranking",
+      "stage": "rule"
+    },
+    {
+      "id": "g-004",
+      "predictedTopicId": "screening_ranking",
+      "stage": "rule"
+    },
+    {
+      "id": "g-005",
+      "predictedTopicId": "screening_ranking",
+      "stage": "rule"
+    },
+    {
+      "id": "g-006",
+      "predictedTopicId": "screening_ranking",
+      "stage": "rule"
+    },
+    {
+      "id": "g-007",
+      "predictedTopicId": "screening_ranking",
+      "stage": "rule"
+    },
+    {
+      "id": "g-008",
+      "predictedTopicId": "airport_diagnostic",
+      "stage": "rule"
+    },
+    {
+      "id": "g-009",
+      "predictedTopicId": "airport_diagnostic",
+      "stage": "rule"
+    },
+    {
+      "id": "g-010",
+      "predictedTopicId": "airport_diagnostic",
+      "stage": "rule"
+    },
+    {
+      "id": "g-011",
+      "predictedTopicId": "airport_diagnostic",
+      "stage": "rule"
+    },
+    {
+      "id": "g-012",
+      "predictedTopicId": "airport_diagnostic",
+      "stage": "rule"
+    },
+    {
+      "id": "g-013",
+      "predictedTopicId": "airport_diagnostic",
+      "stage": "rule"
+    },
+    {
+      "id": "g-014",
+      "predictedTopicId": "airport_diagnostic",
+      "stage": "rule"
+    },
+    {
+      "id": "g-015",
+      "predictedTopicId": "comparison",
+      "stage": "rule"
+    },
+    {
+      "id": "g-016",
+      "predictedTopicId": "comparison",
+      "stage": "rule"
+    },
+    {
+      "id": "g-017",
+      "predictedTopicId": "comparison",
+      "stage": "rule"
+    },
+    {
+      "id": "g-018",
+      "predictedTopicId": "comparison",
+      "stage": "rule"
+    },
+    {
+      "id": "g-019",
+      "predictedTopicId": "comparison",
+      "stage": "rule"
+    },
+    {
+      "id": "g-020",
+      "predictedTopicId": "comparison",
+      "stage": "rule"
+    },
+    {
+      "id": "g-021",
+      "predictedTopicId": "capacity_congestion",
+      "stage": "rule"
+    },
+    {
+      "id": "g-022",
+      "predictedTopicId": "capacity_congestion",
+      "stage": "rule"
+    },
+    {
+      "id": "g-023",
+      "predictedTopicId": "capacity_congestion",
+      "stage": "rule"
+    },
+    {
+      "id": "g-024",
+      "predictedTopicId": "capacity_congestion",
+      "stage": "rule"
+    },
+    {
+      "id": "g-025",
+      "predictedTopicId": "capacity_congestion",
+      "stage": "rule"
+    },
+    {
+      "id": "g-026",
+      "predictedTopicId": "capacity_congestion",
+      "stage": "rule"
+    },
+    {
+      "id": "g-027",
+      "predictedTopicId": "capacity_congestion",
+      "stage": "rule"
+    },
+    {
+      "id": "g-028",
+      "predictedTopicId": "growth_momentum",
+      "stage": "rule"
+    },
+    {
+      "id": "g-029",
+      "predictedTopicId": "growth_momentum",
+      "stage": "rule"
+    },
+    {
+      "id": "g-030",
+      "predictedTopicId": "growth_momentum",
+      "stage": "rule"
+    },
+    {
+      "id": "g-031",
+      "predictedTopicId": "growth_momentum",
+      "stage": "rule"
+    },
+    {
+      "id": "g-032",
+      "predictedTopicId": "growth_momentum",
+      "stage": "rule"
+    },
+    {
+      "id": "g-033",
+      "predictedTopicId": "growth_momentum",
+      "stage": "rule"
+    },
+    {
+      "id": "g-034",
+      "predictedTopicId": "traffic_mix",
+      "stage": "rule"
+    },
+    {
+      "id": "g-035",
+      "predictedTopicId": "traffic_mix",
+      "stage": "rule"
+    },
+    {
+      "id": "g-036",
+      "predictedTopicId": "traffic_mix",
+      "stage": "rule"
+    },
+    {
+      "id": "g-037",
+      "predictedTopicId": "traffic_mix",
+      "stage": "rule"
+    },
+    {
+      "id": "g-038",
+      "predictedTopicId": "airport_diagnostic",
+      "stage": "rule"
+    },
+    {
+      "id": "g-039",
+      "predictedTopicId": "traffic_mix",
+      "stage": "rule"
+    },
+    {
+      "id": "g-040",
+      "predictedTopicId": "cargo_freight",
+      "stage": "rule"
+    },
+    {
+      "id": "g-041",
+      "predictedTopicId": "cargo_freight",
+      "stage": "rule"
+    },
+    {
+      "id": "g-042",
+      "predictedTopicId": "cargo_freight",
+      "stage": "rule"
+    },
+    {
+      "id": "g-043",
+      "predictedTopicId": "cargo_freight",
+      "stage": "rule"
+    },
+    {
+      "id": "g-044",
+      "predictedTopicId": "cargo_freight",
+      "stage": "rule"
+    },
+    {
+      "id": "g-045",
+      "predictedTopicId": "cargo_freight",
+      "stage": "rule"
+    },
+    {
+      "id": "g-046",
+      "predictedTopicId": "methodology_explainability",
+      "stage": "rule"
+    },
+    {
+      "id": "g-047",
+      "predictedTopicId": "methodology_explainability",
+      "stage": "rule"
+    },
+    {
+      "id": "g-048",
+      "predictedTopicId": "methodology_explainability",
+      "stage": "rule"
+    },
+    {
+      "id": "g-049",
+      "predictedTopicId": "methodology_explainability",
+      "stage": "rule"
+    },
+    {
+      "id": "g-050",
+      "predictedTopicId": "methodology_explainability",
+      "stage": "rule"
+    },
+    {
+      "id": "g-051",
+      "predictedTopicId": "methodology_explainability",
+      "stage": "rule"
+    },
+    {
+      "id": "g-052",
+      "predictedTopicId": "scope_boundary",
+      "stage": "rule"
+    },
+    {
+      "id": "g-053",
+      "predictedTopicId": "scope_boundary",
+      "stage": "rule"
+    },
+    {
+      "id": "g-054",
+      "predictedTopicId": "scope_boundary",
+      "stage": "rule"
+    },
+    {
+      "id": "g-055",
+      "predictedTopicId": "scope_boundary",
+      "stage": "rule"
+    },
+    {
+      "id": "g-056",
+      "predictedTopicId": "scope_boundary",
+      "stage": "rule"
+    },
+    {
+      "id": "g-057",
+      "predictedTopicId": "scope_boundary",
+      "stage": "rule"
+    },
+    {
+      "id": "g-058",
+      "predictedTopicId": "off_domain",
+      "stage": "rule"
+    },
+    {
+      "id": "g-059",
+      "predictedTopicId": "off_domain",
+      "stage": "rule"
+    },
+    {
+      "id": "g-060",
+      "predictedTopicId": "off_domain",
+      "stage": "rule"
+    },
+    {
+      "id": "g-061",
+      "predictedTopicId": "off_domain",
+      "stage": "rule"
+    },
+    {
+      "id": "g-062",
+      "predictedTopicId": "off_domain",
+      "stage": "rule"
+    },
+    {
+      "id": "g-063",
+      "predictedTopicId": "off_domain",
+      "stage": "llm"
+    }
+  ]
+}
