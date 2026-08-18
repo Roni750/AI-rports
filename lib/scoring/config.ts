@@ -166,8 +166,19 @@ export const DATA_PROVENANCE = {
   source: "US Bureau of Transportation Statistics, T-100 Segment (All Carriers)",
   coverage:
     "Scheduled passenger service, domestic and international, US and foreign carriers",
+  /** T-100 only. On-Time Performance has its own, shorter coverage — see `delayYear`. */
   years: [2019, 2023, 2024],
   excludedYears: "2020-2021 excluded as pandemic-distorted; 2022 excluded as still recovering",
+  /**
+   * On-Time Performance covers ONE year, not the three above.
+   *
+   * The capacity-strain component is a level — "is this airport congested today" — so the most
+   * recent complete year answers it, and a second year would not change the 2024 reading. What a
+   * second year would add is DIRECTION, which the score currently cannot express: an airport whose
+   * delays are easing and one whose delays are worsening score identically if they land on the
+   * same 2024 value. Named separately so no answer can imply a trend the data cannot support.
+   */
+  delayYear: 2024,
   serviceClasses: "A, C, E, F (scheduled passenger). Cargo (G, P, R) reported separately.",
   notes:
     "T-100 is mandatory carrier-reported data, comprehensive but self-reported rather than independently measured.",

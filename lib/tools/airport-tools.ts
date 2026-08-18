@@ -173,7 +173,16 @@ function scoredDefault() {
  * significant share of a token-per-minute budget for no added information. What stays here is the
  * short reminder plus anything genuinely specific to the individual result.
  */
-const VINTAGE = `BTS T-100 + On-Time Performance; ${DATA_PROVENANCE.years.join("/")}`;
+/**
+ * The two sources do NOT share a vintage, and saying so matters.
+ *
+ * `DATA_PROVENANCE.years` describes T-100 only. Appending it to a label that also names On-Time
+ * Performance claimed three years of delay data when there is one, which understated how much of
+ * the score rests on a single year — the opposite of what this envelope is for.
+ */
+const VINTAGE =
+  `BTS T-100 ${DATA_PROVENANCE.years.join("/")}; ` +
+  `On-Time Performance ${DATA_PROVENANCE.delayYear} only`;
 
 const BASE_ASSUMPTIONS = ["Scheduled passenger service only; cargo counted separately."];
 

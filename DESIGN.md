@@ -144,6 +144,13 @@ predictability beats autonomy.
 ### Known limitations, stated
 - **Delay data covers 195 of 728 airports** (larger reporting carriers only). Airports without it
   are not penalised: the missing component's weight is redistributed and the result records why.
+- **Delay data covers one year, where traffic covers three.** Capacity strain is deliberately a
+  *level* — "is this airport congested today" — which the most recent complete year answers, and a
+  second year would not change the 2024 reading. What is missing is **direction**: an airport whose
+  delays are easing and one whose delays are worsening score identically if they land on the same
+  2024 value, and a single year cannot tell an anomalous year from a structural one. This is the
+  one place the pipeline does not apply its own 2019-as-pre-COVID-baseline logic, and closing it is
+  the first thing I would extend (see §8).
 - **Legal capacity caps are invisible.** Santa Ana operates under a noise curfew and a negotiated
   cap on passengers and daily departures. Its ceiling is a legal instrument, not a runway — and its
   80.2% load factor captures none of it.
