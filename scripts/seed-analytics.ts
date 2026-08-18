@@ -19,8 +19,11 @@
 
 import { randomUUID } from "node:crypto";
 
-import { loadEnvLocal } from "./load-env";
-import { runAgent, AgentError, type ChatMessage } from "../lib/agent/agent";
+// First, above every import that reads configuration at module scope — DEFAULT_MODEL below is one
+// of them, and this script records it against every turn it writes.
+import "./boot-env";
+
+import { runAgent, AgentError, DEFAULT_MODEL, type ChatMessage } from "../lib/agent/agent";
 import { APP_VERSION, DEFAULT_TENANT } from "../lib/analytics/config";
 import { recordTurn } from "../lib/analytics/record";
 import { SEED_CORPUS, SEED_TURN_COUNT } from "../lib/analytics/seed/corpus";
@@ -44,7 +47,6 @@ function errorKindOf(err: unknown): ErrorKind {
 }
 
 async function main(): Promise<void> {
-  loadEnvLocal();
 
   console.log(`corpus: ${SEED_CORPUS.length} conversations, ${SEED_TURN_COUNT} turns`);
   console.log(`timestamps spread across the last ${spreadDays} days`);
@@ -127,7 +129,11 @@ async function main(): Promise<void> {
         await recordTurn({
           ...base,
           replyChars: 0,
-          model: process.env.GROQ_MODEL ?? "unknown",
+          // DEFAULT_MODEL, not the env var. GROQ_MODEL is an optional override and is normally
+          // unset, so reading it directly recorded every failed turn as "unknown" — losing the
+          // attribution on exactly the rows where "which model failed?" is the question. The chat
+          // route was fixed for this; the seeder is the other call site and needs the same value.
+          model: DEFAULT_MODEL,
           iterations: 0,
           modelCalls: 0,
           promptTokens: null,

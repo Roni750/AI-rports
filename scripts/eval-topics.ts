@@ -13,10 +13,15 @@
  *      npm run eval:topics -- --hybrid --freeze   records predictions.v1.json for the CI gate
  */
 
+// First: CLASSIFIER_MODEL and ACTIVE_CLASSIFIER_VERSION are module-scope constants, so a
+// `loadEnvLocal()` inside main() would run after they were already fixed — and this script PRINTS
+// the model it is about to use. Reporting one model while calling another is the specific way a
+// measurement tool lies.
+import "./boot-env";
+
 import { writeFileSync } from "node:fs";
 import path from "node:path";
 
-import { loadEnvLocal } from "./load-env";
 import { classifyByRules, hasConflict, TOPIC_RULES } from "../lib/analytics/classify-rules";
 import { ACTIVE_CLASSIFIER_VERSION, CLASSIFIER_MODEL } from "../lib/analytics/classifier-version";
 import { loadGoldSet } from "../lib/analytics/eval/gold";
@@ -36,8 +41,6 @@ function pad(s: string, width: number): string {
 }
 
 async function main(): Promise<void> {
-  loadEnvLocal();
-
   // Refuse to run the hybrid mode without a key rather than degrading to abstentions. Without
   // this guard the run still completes and still prints a report — one that looks like a model
   // declining to classify, when in fact no request was ever made. A measurement tool that fails

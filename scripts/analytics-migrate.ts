@@ -12,6 +12,12 @@
  * Run: npm run analytics:migrate      (from the project root — the default DB path is relative)
  */
 
+// First: `migrate()` opens whichever database ANALYTICS_DB_URL names, and without this the
+// variable from `.env.local` is invisible here. The script would then migrate the local file and
+// report success while the configured deployment database stayed at version 0 — so the first real
+// request hits tables that do not exist.
+import "./boot-env";
+
 import { analyticsStatus, migrate, query } from "../lib/analytics/store";
 import { HEAD_VERSION } from "../lib/analytics/migrations";
 

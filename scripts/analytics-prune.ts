@@ -16,15 +16,22 @@
  *      npm run analytics:prune -- --session <id>   erase one conversation
  */
 
+// First, and before any import that reads configuration at module scope: this script talks to
+// whichever database ANALYTICS_DB_URL names, and reading that from `.env.local` too late means
+// pruning the local file while the configured database keeps every row it was asked to drop.
+import "./boot-env";
+
+import { flagValue, hasFlag, numericFlag } from "./args";
 import { RETENTION_DAYS } from "../lib/analytics/config";
 import { query, write } from "../lib/analytics/store";
 
 const args = process.argv.slice(2);
-const dryRun = args.includes("--dry-run");
-const daysArg = args.indexOf("--days");
-const days = daysArg >= 0 ? Number(args[daysArg + 1]) : RETENTION_DAYS;
-const sessionArg = args.indexOf("--session");
-const sessionId = sessionArg >= 0 ? args[sessionArg + 1] : null;
+const dryRun = hasFlag(args, "--dry-run");
+// Both values go through the strict parser. `--session` with no value used to yield `undefined`,
+// which the `if (sessionId)` branch below reads as "no session was asked for" — turning a
+// single-conversation erasure into the 90-day bulk delete. See `args.ts`.
+const days = numericFlag(args, "--days", RETENTION_DAYS);
+const sessionId = flagValue(args, "--session");
 
 async function main(): Promise<void> {
   if (sessionId) {
@@ -39,7 +46,10 @@ async function main(): Promise<void> {
       console.log("--dry-run: nothing deleted");
       return;
     }
-    await write([{ sql: "DELETE FROM session WHERE session_id = ?", args: [sessionId] }]);
+    if (!(await write([{ sql: "DELETE FROM session WHERE session_id = ?", args: [sessionId] }]))) {
+      console.error("delete failed — the database rejected the write, nothing was erased");
+      process.exit(1);
+    }
     console.log("erased — cascades removed its turns, tool calls and labels");
     return;
   }
@@ -67,7 +77,10 @@ async function main(): Promise<void> {
     return;
   }
 
-  await write([{ sql: "DELETE FROM session WHERE started_at < ?", args: [cutoff] }]);
+  if (!(await write([{ sql: "DELETE FROM session WHERE started_at < ?", args: [cutoff] }]))) {
+    console.error("prune failed — the database rejected the write, nothing was deleted");
+    process.exit(1);
+  }
 
   const after = await query("SELECT COUNT(*) AS n FROM turn");
   console.log(`pruned. ${Number(after[0]?.n ?? 0)} turns remain`);
